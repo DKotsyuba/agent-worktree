@@ -1,6 +1,6 @@
 # Architecture
 
-Profile: in-process + local state, stdio MCP, no host adapter, release disabled.
+Profile: in-process + local state, stdio MCP, host adapter (`hook context` for UserPromptSubmit hooks), releases published from tags. Qualification evidence: [qualification.md](qualification.md).
 
 `agent-worktree` manages Git worktrees for an orchestrator: bounded inventory and
 inspection, explicit creation, and preview → apply removal that never loses work.

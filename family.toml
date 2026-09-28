@@ -6,21 +6,21 @@ standard_version = "1.0.0-rc.2"
 response_profile = "rust-minijinja-v1"
 devkit_version = "0.2.0"
 baseline = "rust-macos-2026-09-candidate1"
-qualification = "not_verified"
+qualification = "verified"
 
 [profiles]
 process = "in-process"
 state = "local"
 transports = ["stdio"]
-host_adapter = false
+host_adapter = true
 
 [compatibility]
 candidate_targets = ["aarch64-apple-darwin"]
-qualified_targets = []
-qualified_hosts = []
+qualified_targets = ["aarch64-apple-darwin"]
+qualified_hosts = ["claude-code", "codex"]
 
 [release]
-enabled = false
+enabled = true
 workflow = "release.yml"
 delivery_profile = "single-binary-v1"
 trust_profile = "github-authenticated"
