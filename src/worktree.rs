@@ -340,6 +340,15 @@ pub struct Record {
     pub created_at: u64,
     /// Creator harness attribution; attribution, not authentication.
     pub creator: String,
+    /// Creating session identifier, when known; at most 128 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Caller-stated purpose of the worktree; at most 200 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// Caller-stated time-to-live in seconds; unenforced metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
     /// Optimistic concurrency counter; bumped on every successful write.
     pub revision: u64,
     /// Written before a removal is dispatched, so interrupts stay visible.
@@ -454,6 +463,25 @@ impl Default for Policy {
     }
 }
 
+impl Policy {
+    /// Checks the threshold ordering invariant `recent_after_secs ≤
+    /// idle_after_secs ≤ stale_after_secs`.
+    ///
+    /// Returns `Ok(())` when ordered, or the invariant that is violated so the
+    /// caller can reject the configuration that produced it. `classify` and
+    /// `assess_removal` require an ordered policy; behaviour under an inverted
+    /// one is unspecified.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.recent_after_secs > self.idle_after_secs {
+            Err("recent_after_secs must be ≤ idle_after_secs")
+        } else if self.idle_after_secs > self.stale_after_secs {
+            Err("idle_after_secs must be ≤ stale_after_secs")
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Non-blocking advice derived from an observation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Advice {
@@ -482,6 +510,9 @@ pub enum Warning {
     },
     /// The record shows a dispatched removal that never completed.
     RemovalStarted,
+    /// The stored record disagrees with the observed worktree identity or bound
+    /// path and was ignored for this decision.
+    RecordMismatch,
 }
 
 /// A removal request: preview parameters plus the apply-time expectation.
@@ -608,11 +639,13 @@ pub struct Budget {
 /// Classifies an observation into activity advice and warnings.
 ///
 /// Ordering rules: a live process is `Active`; otherwise the newest available
-/// signal decides — within `recent_after_secs` is `Recent`, at least
-/// `idle_after_secs` is `IdleCandidate`, at least `stale_after_secs` is
-/// `StaleCandidate`; between `recent` and `idle` the answer stays `Recent`
-/// (claiming activity longer is the conservative direction). Missing signals
-/// yield `Unknown`.
+/// signal decides, by explicit bands — age ≤ `recent_after_secs` is `Recent`,
+/// age ≥ `idle_after_secs` is `IdleCandidate`, age ≥ `stale_after_secs` is
+/// `StaleCandidate`. The gap strictly between `recent_after_secs` and
+/// `idle_after_secs` also yields `Recent`, deliberately: claiming activity for
+/// longer is the conservative direction and never fabricates abandonment. A
+/// signal timestamped in the future counts as age 0 (clock-skew tolerance).
+/// Missing signals yield `Unknown`. The policy must satisfy `Policy::validate`.
 ///
 /// Warnings never block: size at or above the policy threshold (a lower bound
 /// counts), unmerged or undeterminable integration, and one `ProbeIncomplete`
@@ -630,12 +663,14 @@ pub fn classify(observation: &Observation, policy: &Policy, now: u64) -> Advice 
             None => Activity::Unknown,
             Some(newest) => {
                 let age = now.saturating_sub(newest);
-                if age >= policy.stale_after_secs {
-                    Activity::StaleCandidate
-                } else if age >= policy.idle_after_secs {
-                    Activity::IdleCandidate
-                } else {
-                    Activity::Recent
+                match age {
+                    _ if age >= policy.stale_after_secs => Activity::StaleCandidate,
+                    _ if age >= policy.idle_after_secs => Activity::IdleCandidate,
+                    // Definitely recent…
+                    _ if age <= policy.recent_after_secs => Activity::Recent,
+                    // …and the gap up to `idle_after_secs` stays Recent too:
+                    // claiming activity longer is the conservative direction.
+                    _ => Activity::Recent,
                 }
             }
         }
@@ -651,6 +686,15 @@ pub fn classify(observation: &Observation, policy: &Policy, now: u64) -> Advice 
 /// always computed from the best available status evidence and returned when
 /// the status probe produced a digest; `expected_fingerprint` is compared
 /// against it only when both exist.
+///
+/// A record whose `repo_id`, `name` or bound `path` disagrees with the
+/// observation is ignored — every veto derives from observation and probes, and
+/// a mismatched fingerprint refuses the removal anyway — and
+/// `Warning::RecordMismatch` is added instead. Ignoring is safe: the record
+/// only contributes the fingerprint's revision binding and the
+/// `RemovalStarted` warning, and a revision that moved (or vanished) between
+/// preview and apply changes the fingerprint, which vetoes. The policy must
+/// satisfy `Policy::validate`.
 #[must_use]
 pub fn assess_removal(
     observation: &Observation,
@@ -661,6 +705,19 @@ pub fn assess_removal(
     let mut vetoes = Vec::new();
     let mut warnings = Vec::new();
     collect_warnings(observation, policy, &mut warnings);
+    let record_matches = |record: &Record| {
+        record.repo_id == observation.id.repo.as_str()
+            && record.name == observation.id.name
+            && record.path == observation.registration.path
+    };
+    let record = match record {
+        Some(record) if record_matches(record) => Some(record),
+        Some(_) => {
+            warnings.push(Warning::RecordMismatch);
+            None
+        }
+        None => None,
+    };
     if record.is_some_and(|r| r.removal_started.is_some()) {
         warnings.push(Warning::RemovalStarted);
     }
@@ -1004,6 +1061,9 @@ mod tests {
             base_oid: None,
             created_at: 500,
             creator: "harness".to_owned(),
+            session: None,
+            purpose: None,
+            ttl_secs: None,
             revision: 3,
             removal_started: None,
         }
@@ -1528,5 +1588,116 @@ mod tests {
         let observation = sample_observation();
         let decision = assess_removal(&observation, None, &RemovalRequest::default(), &policy);
         assert_eq!(decision.vetoes, vec![Veto::ProbeUnknown]);
+    }
+
+    #[test]
+    fn disposable_path_adversarial_cases() {
+        let approved = |path: &str| vec![PathBuf::from(path)];
+        // Over-broad or relative-escape approvals cover nothing.
+        assert!(!is_disposable("target", &approved("")));
+        assert!(!is_disposable(".", &approved(".")));
+        assert!(!is_disposable("..", &approved("..")));
+        assert!(!is_disposable("/etc/passwd", &approved("/etc")));
+        assert!(!is_disposable("target", &approved("./target")));
+        // Component-wise coverage, trailing-slash insensitive.
+        assert!(is_disposable("target", &approved("target")));
+        assert!(is_disposable("target/debug", &approved("target/")));
+        assert!(!is_disposable("targetx", &approved("target")));
+        // An approval deeper than the ignored path does not cover it.
+        assert!(!is_disposable("target", &approved("target/debug")));
+    }
+
+    #[test]
+    fn classify_tolerates_future_mtime() {
+        // A clock skewed into the future counts as age 0, never negative.
+        let now = 10_000_000_u64;
+        let observation = with(&clean_observation(), |o| {
+            o.live_processes = Probe::Known(false);
+            o.activity_signals = ActivitySignals {
+                head_mtime: Some(now + 3_600),
+                index_mtime: None,
+                last_reflog_entry: None,
+            };
+        });
+        assert_eq!(
+            classify(&observation, &Policy::default(), now).activity,
+            Activity::Recent
+        );
+    }
+
+    #[test]
+    fn policy_thresholds_validated() {
+        assert_eq!(Policy::default().validate(), Ok(()));
+        let inverted_recent = Policy {
+            recent_after_secs: 8 * 24 * 60 * 60,
+            ..Policy::default()
+        };
+        assert!(inverted_recent.validate().is_err());
+        let inverted_idle = Policy {
+            idle_after_secs: 60 * 24 * 60 * 60,
+            ..Policy::default()
+        };
+        assert!(inverted_idle.validate().is_err());
+    }
+
+    #[test]
+    fn allow_unmerged_waives_only_the_integration_probe() {
+        let policy = Policy::default();
+        let clean = clean_observation();
+        // Waived integration probe: no veto, warning stays.
+        let unchecked = with(&clean, |o| o.integration = Probe::NotChecked);
+        let waived = assess_removal(
+            &unchecked,
+            None,
+            &RemovalRequest {
+                allow_unmerged: true,
+                ..RemovalRequest::default()
+            },
+            &policy,
+        );
+        assert!(waived.vetoes.is_empty());
+        assert!(waived.warnings.contains(&Warning::IntegrationUnknown));
+        // The waiver does not excuse any other unknown probe.
+        let blind_status = with(&unchecked, |o| o.status = Probe::NotChecked);
+        let still_vetoed = assess_removal(
+            &blind_status,
+            None,
+            &RemovalRequest {
+                allow_unmerged: true,
+                ..RemovalRequest::default()
+            },
+            &policy,
+        );
+        assert_eq!(still_vetoed.vetoes, vec![Veto::ProbeUnknown]);
+    }
+
+    #[test]
+    fn assess_removal_ignores_mismatched_record() {
+        let policy = Policy::default();
+        let clean = clean_observation();
+        let mut mismatched = sample_record();
+        mismatched.name = "someone-else".to_owned();
+        mismatched.removal_started = Some(RemovalStarted {
+            fingerprint: Fingerprint::parse(&"0".repeat(64)).unwrap(),
+            at: 999,
+        });
+        let with_record = assess_removal(
+            &clean,
+            Some(&mismatched),
+            &RemovalRequest::default(),
+            &policy,
+        );
+        let without_record = assess_removal(&clean, None, &RemovalRequest::default(), &policy);
+        assert_eq!(with_record.vetoes, without_record.vetoes);
+        assert!(with_record.warnings.contains(&Warning::RecordMismatch));
+        assert!(!with_record.warnings.contains(&Warning::RemovalStarted));
+        // The ignored record does not leak its revision into the fingerprint.
+        assert_eq!(with_record.fingerprint, without_record.fingerprint);
+
+        // A record matching on identity and path still binds normally.
+        let matching = sample_record();
+        let bound = assess_removal(&clean, Some(&matching), &RemovalRequest::default(), &policy);
+        assert!(!bound.warnings.contains(&Warning::RecordMismatch));
+        assert_ne!(bound.fingerprint, without_record.fingerprint);
     }
 }
