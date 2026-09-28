@@ -33,12 +33,13 @@ struct RowView {
     key: String,
     class: &'static str,
     branch: String,
+    creator: String,
     size: String,
     path: String,
 }
 
-/// Formats the size axis: exact, lower bound, or not measured.
-fn size_label(row: &ListRow) -> String {
+/// Formats the size axis: exact, lower bound, unmeasured, or not requested.
+fn size_label(row: &ListRow, requested: bool) -> String {
     match &row.size {
         Some(size) => {
             let quality = match size.quality {
@@ -47,6 +48,7 @@ fn size_label(row: &ListRow) -> String {
             };
             format!("{}{quality}", response::human_bytes(size.bytes))
         }
+        None if requested => "unmeasured".to_owned(),
         None => "-".to_owned(),
     }
 }
@@ -98,6 +100,7 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
     let Ok(parsed) = serde_json::from_value::<service::ListArgs>(args) else {
         return response::invalid_arguments(templates, "list_worktrees", ARGS);
     };
+    let include_size = parsed.size.unwrap_or(false);
     let outcome = match service.list_worktrees(&parsed).await {
         Ok(outcome) => outcome,
         Err(error) => return response::failure(templates, &error),
@@ -124,7 +127,8 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
                 key: row.key.clone(),
                 class: row.class_label(),
                 branch: row.branch_label().to_owned(),
-                size: size_label(row),
+                creator: row.creator.clone().unwrap_or_else(|| "-".to_owned()),
+                size: size_label(row, include_size),
                 path: row.path.display().to_string(),
             })
             .collect(),
@@ -165,6 +169,7 @@ mod tests {
             branch: Some("refs/heads/aw/task-1".to_owned()),
             detached: false,
             head: None,
+            creator: Some("claude-code".to_owned()),
             size: Some(Size {
                 bytes: 2_u64 << 30,
                 quality: crate::worktree::SizeQuality::LowerBound,
@@ -182,6 +187,7 @@ mod tests {
                 key: "0123456789ab/task-1".to_owned(),
                 class: "managed",
                 branch: "refs/heads/aw/task-1".to_owned(),
+                creator: "claude-code".to_owned(),
                 size: "2.0 GiB (lower bound)".to_owned(),
                 path: "/tmp/w/demo--0123456789ab/task-1".to_owned(),
             }],
@@ -201,7 +207,11 @@ mod tests {
     #[test]
     fn size_and_coverage_labels() {
         let row = sample_row();
-        assert_eq!(size_label(&row), "2.0 GiB (lower bound)");
+        assert_eq!(size_label(&row, true), "2.0 GiB (lower bound)");
+        let mut unmeasured = row;
+        unmeasured.size = None;
+        assert_eq!(size_label(&unmeasured, true), "unmeasured");
+        assert_eq!(size_label(&unmeasured, false), "-");
         let coverage = Coverage {
             repos: 3,
             registry: 1,
@@ -219,7 +229,7 @@ mod tests {
         let result = call(
             serde_json::json!({"nope": 1}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));
@@ -232,7 +242,7 @@ mod tests {
         let result = call(
             serde_json::json!({"limit": 21}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));
@@ -245,7 +255,7 @@ mod tests {
         let result = call(
             serde_json::json!({"cursor": "!!!!"}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));

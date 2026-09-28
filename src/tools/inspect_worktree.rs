@@ -7,7 +7,7 @@
 use crate::response::{self, Class, Templates};
 use crate::service::{self, InspectOutcome, Service};
 use crate::worktree::{
-    Activity, Integration, Probe, Size, SizeQuality, StatusFacts, SubmoduleFacts, Warning,
+    Activity, Integration, Probe, Size, SizeQuality, StatusFacts, SubmoduleFacts,
 };
 use rmcp::model::CallToolResult;
 use serde::Serialize;
@@ -35,6 +35,7 @@ struct View {
     processes: String,
     size: String,
     locked: String,
+    record: Option<String>,
     removal_started: Option<String>,
     warnings: Option<String>,
     hygiene: String,
@@ -144,21 +145,6 @@ fn size_label(probe: &Probe<Size>) -> String {
     }
 }
 
-/// One advisory warning as a stable display code.
-fn warning_label(warning: &Warning) -> String {
-    match warning {
-        Warning::SizeAtLeast { bytes } => {
-            format!("size_at_least {}", response::human_bytes(*bytes))
-        }
-        Warning::Unmerged => "unmerged".to_owned(),
-        Warning::IntegrationUnknown => "integration_unknown".to_owned(),
-        Warning::ProbeIncomplete { reason } => {
-            format!("probe_incomplete ({})", response::bounded(reason, 80))
-        }
-        Warning::RemovalStarted => "removal_started".to_owned(),
-    }
-}
-
 pub fn definition() -> Value {
     json!({"name":"inspect_worktree",
         "description":"Inspect one worktree with bounded probes: activity, integration ancestry, status counts, submodules, live processes and optional size. Read-only. Unknown, unavailable or incomplete checks are reported as such, never as clean.",
@@ -203,7 +189,7 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
         advice.activity,
         Activity::IdleCandidate | Activity::StaleCandidate
     );
-    let warnings: Vec<String> = advice.warnings.iter().map(warning_label).collect();
+    let warnings = response::warning_line(&advice.warnings);
     let view = View {
         key,
         class: crate::service::class_label(class),
@@ -242,7 +228,22 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
                     started.at
                 )
             }),
-        warnings: response::join_warnings(&warnings),
+        record: record.as_ref().map(|r| {
+            let meta = format!(
+                "creator={} created={} purpose={}",
+                r.creator,
+                r.created_at,
+                r.purpose.as_deref().unwrap_or("-")
+            );
+            let extra = match (&r.session, &r.ttl_secs) {
+                (Some(session), Some(ttl)) => format!(" session={session} ttl={ttl}s"),
+                (Some(session), None) => format!(" session={session}"),
+                (None, Some(ttl)) => format!(" ttl={ttl}s"),
+                (None, None) => String::new(),
+            };
+            response::bounded(&format!("{meta}{extra}"), 400)
+        }),
+        warnings,
         hygiene: format!(
             "stale_activity={} large={} missing={}",
             stale,
@@ -336,6 +337,7 @@ mod tests {
             processes: "none".to_owned(),
             size: "not checked".to_owned(),
             locked: "-".to_owned(),
+            record: Some("creator=harness created=1800000000 purpose=ship the release".to_owned()),
             removal_started: None,
             warnings: Some("unmerged".to_owned()),
             hygiene: "stale_activity=true large=false missing=false".to_owned(),
@@ -355,7 +357,7 @@ mod tests {
         let result = call(
             serde_json::json!({"repo":"/repo","name":"task-1","nope":true}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));
@@ -364,20 +366,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_required() {
+    async fn missing_repo_refused_by_git() {
         let result = call(
             serde_json::json!({"repo":"/repo"}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));
         let text = crate::response::first_text(&result);
-        // Both missing reaches resolve_target, which refuses; in this checkout
-        // the repo resolution itself fails closed first with not_implemented.
-        assert!(
-            text.starts_with("ERROR not_implemented:") || text.starts_with("ERROR target_"),
-            "{text}"
-        );
+        assert!(text.starts_with("ERROR not_a_repository:"), "{text}");
     }
 }

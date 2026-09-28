@@ -9,6 +9,9 @@ Submodules: {{ submodules }}
 Processes: {{ processes }}
 Size: {{ size }}
 Locked: {{ locked }}
+{% if record %}
+Record: {{ record }}
+{% endif %}
 {% if removal_started %}
 Removal started: {{ removal_started }}
 {% endif %}

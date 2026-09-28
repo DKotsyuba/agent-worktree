@@ -6,6 +6,6 @@ Disposable: target/
 Eligible: false (2 vetoes)
 Veto: dirty
 Veto: ignored_not_disposable (dist/, node_modules/)
-Warnings: Unmerged
+Warnings: unmerged
 Fingerprint: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 Next: resolve the vetoes above, then rerun the preview.

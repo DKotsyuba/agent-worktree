@@ -1,6 +1,6 @@
 //! Application service: composes Git access, local state and pure policy per call.
 //!
-//! Every operation is a plain async function over the frozen contracts in
+//! Every operation is a plain async function over the contracts in
 //! [`crate::git`], [`crate::store`] and [`crate::worktree`]. This layer owns
 //! outcomes, effects, deadlines, idempotency and recovery; it produces typed
 //! results plus stable codes, never MCP prose. Rendering happens in
@@ -32,8 +32,6 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_ENTRIES: usize = 200_000;
 /// Cap on orphan-candidate directory entries read per repository.
 const MAX_ORPHAN_ENTRIES: usize = 512;
-/// Integration ref assumed when a repository has no registry entry yet.
-const DEFAULT_INTEGRATION_REF: &str = "main";
 /// Maximum accepted `limit` for list pages.
 pub const MAX_PAGE_ROWS: usize = 20;
 /// Byte budget reserved for page furniture (header, hygiene, coverage, cursor).
@@ -44,7 +42,7 @@ const PAGE_ROW_BUDGET: usize = 7 * 1024;
 pub enum ServiceOutcome {
     /// Preconditions or authorization prevent the operation.
     Blocked,
-    /// A needed capability is unavailable (including not implemented yet).
+    /// A needed capability is unavailable.
     Unavailable,
     /// An effect may have happened; reconciliation is required.
     OutcomeUnknown,
@@ -182,12 +180,14 @@ pub struct Service {
 }
 
 impl Service {
-    /// Builds the service with default policy.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            policy: Policy::default(),
-        }
+    /// Builds the service with the default policy, validated once.
+    ///
+    /// An inverted policy would make `classify` and `assess_removal`
+    /// behaviour unspecified, so a violated invariant refuses startup.
+    pub fn new() -> Result<Self, &'static str> {
+        let policy = Policy::default();
+        policy.validate()?;
+        Ok(Self { policy })
     }
 
     /// Resolves the product home and worktree root from the environment.
@@ -207,11 +207,12 @@ impl Service {
             .map_err(git_read_error)?;
         let repo_id = RepoId::from_common_dir(&common_dir);
         let entry = known_repo_entry(layout, &repo_id, &common_dir)?;
+        let integration_ref = (!entry.integration_ref.is_empty()).then_some(entry.integration_ref);
         Ok(RepoScope {
             common_dir,
             repo_id,
             label: entry.label,
-            integration_ref: entry.integration_ref,
+            integration_ref,
         })
     }
 
@@ -226,17 +227,24 @@ impl Service {
             .join(name.as_str());
         let key = format!("{}/{}", scope.repo_id.id12(), name.as_str());
         let op_budget = budget(MUTATION_SECS);
-        let _guard = store::lock_repo(&layout.home, scope.repo_id.as_str(), &op_budget)
+        let guard = store::lock_repo(&layout.home, &scope.repo_id, &op_budget)
             .await
             .map_err(store_error)?;
 
         // Idempotency from Git plus the record, under the repository lock.
-        let record = store::read_record(&layout.home, scope.repo_id.as_str(), name.as_str())
-            .map_err(store_error)?;
+        // Git records canonical paths (/private/… on macOS), while the root
+        // comes from the environment, so comparisons use the canonical form.
+        let record =
+            store::read_record(&layout.home, &scope.repo_id, &name).map_err(store_error)?;
         let inventory = git::inventory(&scope.common_dir, &op_budget)
             .await
             .map_err(git_read_error)?;
-        if let Some(registration) = inventory.iter().find(|r| r.path == destination) {
+        let destination_key =
+            std::fs::canonicalize(&destination).unwrap_or_else(|_| destination.clone());
+        if let Some(registration) = inventory
+            .iter()
+            .find(|r| r.path == destination_key || r.path == destination)
+        {
             if let Some(record) = &record {
                 if record.matches_request(args) {
                     return Ok(CreateOutcome::Noop {
@@ -244,6 +252,9 @@ impl Service {
                         path: registration.path.clone(),
                         branch: registration.branch.clone(),
                         head: registration.head.clone(),
+                        creator: record.creator.clone(),
+                        purpose: record.purpose.clone(),
+                        created_at: record.created_at,
                     });
                 }
                 return Err(ServiceError::blocked(
@@ -279,21 +290,29 @@ impl Service {
             branch: args.branch.as_deref(),
             detached: args.detached,
         };
-        let created = git_create(&scope.common_dir, &spec, &op_budget)
+        let created = git::create(&scope.common_dir, &spec, &op_budget)
             .await
             .map_err(|e| git_mutation_error(e, &format!("create_worktree {key}"), &destination))?;
 
         // Register the known repository; creation is what records repositories.
+        // The integration ref is derived from the main worktree's branch when
+        // the registry has none yet, and left empty (unknown) when neither
+        // source exists — `main` is never assumed.
         let now = unix_now();
         let mut warnings = Vec::new();
+        let integration_ref = scope
+            .integration_ref
+            .clone()
+            .or_else(|| derived_integration(&inventory))
+            .unwrap_or_default();
         let entry = KnownRepo {
             repo_id: scope.repo_id.as_str().to_owned(),
             common_dir: scope.common_dir.clone(),
             label: scope.label.clone(),
-            integration_ref: scope.integration_ref.clone(),
+            integration_ref,
             registered_at: now,
         };
-        if let Err(error) = store::add_known_repo(&layout.home, &entry) {
+        if let Err(error) = store::add_known_repo(&layout.home, &guard, &op_budget, &entry) {
             warnings.push(format!("registry_write_failed: {}", error.code.as_str()));
         }
         // The record is written after the confirmed effect; a failure here is a
@@ -308,10 +327,13 @@ impl Service {
             base_oid: Some(created.head.clone()),
             created_at: now,
             creator: crate::response::bounded(&args.creator, 64),
+            session: args.session.clone(),
+            purpose: Some(args.purpose.clone()),
+            ttl_secs: args.ttl,
             revision: 0,
             removal_started: None,
         };
-        if let Err(error) = store::replace_record(&layout.home, &record, 0) {
+        if let Err(error) = store::replace_record(&layout.home, &guard, &record, 0) {
             warnings.push(format!("record_write_failed: {}", error.code.as_str()));
         }
         Ok(CreateOutcome::Created {
@@ -319,6 +341,9 @@ impl Service {
             path: created.path,
             branch: created.branch,
             head: created.head,
+            creator: record.creator,
+            purpose: record.purpose,
+            created_at: record.created_at,
             warnings,
         })
     }
@@ -362,7 +387,8 @@ impl Service {
                     repo_id: RepoId::from_common_dir(&entry.common_dir),
                     common_dir: entry.common_dir.clone(),
                     label: entry.label.clone(),
-                    integration_ref: entry.integration_ref.clone(),
+                    integration_ref: (!entry.integration_ref.is_empty())
+                        .then_some(entry.integration_ref.clone()),
                 });
             }
             if discovery {
@@ -380,7 +406,8 @@ impl Service {
                         repo_id,
                         common_dir: found.common_dir.clone(),
                         label: entry.label,
-                        integration_ref: entry.integration_ref,
+                        integration_ref: (!entry.integration_ref.is_empty())
+                            .then_some(entry.integration_ref),
                     });
                 }
             }
@@ -407,8 +434,7 @@ impl Service {
             for registration in &inventory {
                 let name = base_name(&registration.path);
                 registered_names.push(name.clone());
-                let record = store::read_record(&layout.home, scope.repo_id.as_str(), &name)
-                    .map_err(store_error)?;
+                let record = record_for(&layout.home, &scope.repo_id, &name)?;
                 if record
                     .as_ref()
                     .and_then(|r| r.removal_started.as_ref())
@@ -416,12 +442,12 @@ impl Service {
                 {
                     removal_started += 1;
                 }
-                let class = if record.is_some() {
-                    WorktreeClass::Managed
-                } else if registration.prunable.is_some()
+                let class = if registration.prunable.is_some()
                     || !registration.path.try_exists().unwrap_or(false)
                 {
                     WorktreeClass::Missing
+                } else if record.is_some() {
+                    WorktreeClass::Managed
                 } else {
                     WorktreeClass::Foreign
                 };
@@ -433,6 +459,7 @@ impl Service {
                     branch: registration.branch.clone(),
                     detached: registration.detached,
                     head: registration.head.clone(),
+                    creator: record.as_ref().map(|r| r.creator.clone()),
                     size: None,
                 });
             }
@@ -461,6 +488,7 @@ impl Service {
                         branch: None,
                         detached: false,
                         head: None,
+                        creator: None,
                         size: None,
                     });
                 }
@@ -524,11 +552,16 @@ impl Service {
     }
 
     /// Measures size for the rows shown on this page only.
+    ///
+    /// All rows share one observation budget, so a whole page of slow trees
+    /// cannot multiply into an unbounded call; rows past the deadline stay
+    /// unmeasured (rendered distinctly from "not requested").
     async fn measure_page(&self, rows: Vec<ListRow>) -> Vec<ListRow> {
+        let shared = budget(OBSERVE_SECS);
         let mut measured = Vec::with_capacity(rows.len());
         for mut row in rows {
             if row.class != WorktreeClass::Missing
-                && let Ok(size) = git::measure_size(&row.path, &budget(OBSERVE_SECS)).await
+                && let Ok(size) = git::measure_size(&row.path, &shared).await
             {
                 row.size = Some(size);
             }
@@ -544,19 +577,19 @@ impl Service {
     ) -> Result<InspectOutcome, ServiceError> {
         let layout = self.layout()?;
         let scope = self.repo_scope(&layout, &args.repo).await?;
-        let target = self
+        let resolved = self
             .resolve_target(&scope, args.name.as_deref(), args.path.as_deref())
             .await?;
+        let target = &resolved.target;
         let checks = args.checks();
         let observation = git::observe(
             &scope.common_dir,
-            &observe_spec(&target.path, &scope.integration_ref, checks),
+            &observe_spec(&target.path, resolved.integration_ref.as_deref(), checks),
             &budget(OBSERVE_SECS),
         )
         .await
         .map_err(git_read_error)?;
-        let record = store::read_record(&layout.home, scope.repo_id.as_str(), &target.name)
-            .map_err(store_error)?;
+        let record = record_for(&layout.home, &scope.repo_id, &target.name)?;
         let mut advice = worktree::classify(&observation, &self.policy, unix_now());
         // classify has no record parameter, so the interrupted-removal warning
         // is added here from the record this call already read.
@@ -569,10 +602,10 @@ impl Service {
                 .warnings
                 .push(crate::worktree::Warning::RemovalStarted);
         }
-        let class = if record.is_some() {
-            WorktreeClass::Managed
-        } else if !target.path.try_exists().unwrap_or(false) {
+        let class = if !target.path.try_exists().unwrap_or(false) {
             WorktreeClass::Missing
+        } else if record.is_some() {
+            WorktreeClass::Managed
         } else {
             WorktreeClass::Foreign
         };
@@ -605,13 +638,39 @@ impl Service {
         let allow_unmerged = args.allow_unmerged.unwrap_or(false);
         let layout = self.layout()?;
         let scope = self.repo_scope(&layout, &args.repo).await?;
-        let target = self
+        let resolved = match self
             .resolve_target(&scope, args.name.as_deref(), args.path.as_deref())
-            .await?;
+            .await
+        {
+            Ok(resolved) => resolved,
+            // A replayed apply whose worktree is fully gone (no registration,
+            // no directory) is a safe no-op, mirroring `git`'s AlreadyAbsent.
+            Err(error)
+                if mode == RemoveMode::Apply
+                    && error.code == "not_found"
+                    && !replay_target(&layout, &scope, args)
+                        .1
+                        .try_exists()
+                        .unwrap_or(false) =>
+            {
+                let (name, path) = replay_target(&layout, &scope, args);
+                return Ok(RemoveOutcome::Applied {
+                    key: format!("{}/{}", scope.repo_id.id12(), name),
+                    path,
+                    branch: None,
+                    outcome: RemoveOutcomeKind::AlreadyAbsent,
+                    warnings: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let target = resolved.target;
         let key = format!("{}/{}", scope.repo_id.id12(), target.name);
-        let record = store::read_record(&layout.home, scope.repo_id.as_str(), &target.name)
-            .map_err(store_error)?;
-        // Preview observes everything; apply re-observes under the lock.
+        let record = record_for(&layout.home, &scope.repo_id, &target.name)?;
+        // Preview observes everything; apply re-observes under the lock with
+        // status checks immediately before dispatch, because git removes an
+        // ignored-only worktree without --force and the IgnoredNotDisposable
+        // veto from a fresh observation is the only guard.
         let observe_all = Checks {
             status: true,
             integration: true,
@@ -627,7 +686,11 @@ impl Service {
         if mode == RemoveMode::Preview {
             let observation = git::observe(
                 &scope.common_dir,
-                &observe_spec(&target.path, &scope.integration_ref, observe_all),
+                &observe_spec(
+                    &target.path,
+                    resolved.integration_ref.as_deref(),
+                    observe_all,
+                ),
                 &budget(OBSERVE_SECS),
             )
             .await
@@ -652,12 +715,16 @@ impl Service {
             None => return Err(ServiceError::blocked("fingerprint_required", "unreachable")),
         };
         let op_budget = budget(MUTATION_SECS);
-        let _guard = store::lock_repo(&layout.home, scope.repo_id.as_str(), &op_budget)
+        let guard = store::lock_repo(&layout.home, &scope.repo_id, &op_budget)
             .await
             .map_err(store_error)?;
         let observation = git::observe(
             &scope.common_dir,
-            &observe_spec(&target.path, &scope.integration_ref, observe_all),
+            &observe_spec(
+                &target.path,
+                resolved.integration_ref.as_deref(),
+                observe_all,
+            ),
             &op_budget,
         )
         .await
@@ -681,25 +748,25 @@ impl Service {
                     .with_next("resolve the vetoes, then rerun the preview"),
             );
         }
-        let fingerprint = match decision.fingerprint.clone() {
-            Some(fingerprint) => fingerprint,
-            None => {
-                return Err(ServiceError::blocked(
-                    "probe_unknown",
-                    "required probes were not known; refusing",
-                ));
-            }
-        };
-        let revision = record.as_ref().map_or(0, |r| r.revision);
-        store::mark_removal_started(
-            &layout.home,
-            scope.repo_id.as_str(),
-            &target.name,
-            &fingerprint,
-            revision,
-            unix_now(),
-        )
-        .map_err(store_error)?;
+        let fingerprint = decision.fingerprint.clone().ok_or_else(|| {
+            ServiceError::blocked("probe_unknown", "required probes were not known; refusing")
+        })?;
+        // Record the dispatch marker first so an interrupt stays visible; a
+        // foreign worktree without a record has nothing to mark.
+        let mut marked_revision = 0;
+        if let (Some(valid_name), Some(record)) = (&resolved.valid_name, &record) {
+            let marked = store::mark_removal_started(
+                &layout.home,
+                &guard,
+                &scope.repo_id,
+                valid_name,
+                &fingerprint,
+                record.revision,
+                unix_now(),
+            )
+            .map_err(store_error)?;
+            marked_revision = marked.revision;
+        }
 
         let branch = target.branch.clone();
         let path = target.path.clone();
@@ -708,7 +775,15 @@ impl Service {
             .map_err(|e| git_mutation_error(e, &format!("remove_worktree {key}"), &path))?;
         // The effect is confirmed past this point; cleanup problems are warnings.
         let mut warnings = Vec::new();
-        if let Err(error) = delete_record(&layout.home, scope.repo_id.as_str(), &target.name) {
+        if let Some(valid_name) = &resolved.valid_name
+            && let Err(error) = store::delete_record(
+                &layout.home,
+                &guard,
+                &scope.repo_id,
+                valid_name,
+                marked_revision,
+            )
+        {
             warnings.push(format!("record_cleanup_failed: {}", error.code.as_str()));
         }
         Ok(RemoveOutcome::Applied {
@@ -725,26 +800,60 @@ impl Service {
         let dry_run = args.dry_run.unwrap_or(true);
         let layout = self.layout()?;
         let scope = self.repo_scope(&layout, &args.repo).await?;
-        let result = git::prune(&scope.common_dir, dry_run, &budget(MUTATION_SECS))
+        let op_budget = budget(MUTATION_SECS);
+        let result = git::prune(&scope.common_dir, dry_run, &op_budget)
             .await
             .map_err(|e| {
                 let target = format!("prune_worktrees {}", scope.repo_id.id12());
                 git_mutation_error(e, &target, &scope.common_dir)
             })?;
+        let mut warnings = Vec::new();
+        if result.applied {
+            // A pruned registration's record is stale (no registration, no
+            // directory); remove it so a later create does not hit a phantom
+            // conflict. Only records bound to the pruned path are deleted.
+            let guard = store::lock_repo(&layout.home, &scope.repo_id, &op_budget)
+                .await
+                .map_err(store_error)?;
+            for candidate in &result.candidates {
+                let name = base_name(candidate);
+                let Ok(Some(record)) = record_for(&layout.home, &scope.repo_id, &name) else {
+                    continue;
+                };
+                if &record.path != candidate {
+                    continue;
+                }
+                if let Some(valid_name) = WorktreeName::parse(&name).ok()
+                    && let Err(error) = store::delete_record(
+                        &layout.home,
+                        &guard,
+                        &scope.repo_id,
+                        &valid_name,
+                        record.revision,
+                    )
+                {
+                    warnings.push(format!("record_cleanup_failed: {}", error.code.as_str()));
+                }
+            }
+        }
         Ok(PruneOutcome {
             repo_id: scope.repo_id.id12().to_owned(),
             candidates: result.candidates,
             applied: result.applied,
+            warnings,
         })
     }
 
     /// Finds one registration by directory name or exact absolute path.
+    ///
+    /// The resolved target also carries the effective integration ref: the
+    /// registry value, else the main worktree's branch, else `None` (unknown).
     async fn resolve_target(
         &self,
         scope: &RepoScope,
         name: Option<&str>,
         path: Option<&str>,
-    ) -> Result<Target, ServiceError> {
+    ) -> Result<ResolvedTarget, ServiceError> {
         let inventory = git::inventory(&scope.common_dir, &budget(INVENTORY_SECS))
             .await
             .map_err(git_read_error)?;
@@ -763,7 +872,12 @@ impl Service {
                         "path must be an absolute path of at most 1024 bytes",
                     ));
                 }
-                inventory.iter().find(|r| r.path == Path::new(path))
+                let requested = PathBuf::from(path);
+                let canonical =
+                    std::fs::canonicalize(&requested).unwrap_or_else(|_| requested.clone());
+                inventory
+                    .iter()
+                    .find(|r| r.path == requested || r.path == canonical)
             }
             _ => {
                 return Err(ServiceError::blocked(
@@ -778,41 +892,21 @@ impl Service {
                 "no Git registration matches the target; orphan directories are not inspectable",
             )
         })?;
-        Ok(Target {
-            name: base_name(&registration.path),
-            path: registration.path.clone(),
-            head: registration.head.clone(),
-            branch: registration.branch.clone(),
+        let name = base_name(&registration.path);
+        Ok(ResolvedTarget {
+            valid_name: WorktreeName::parse(&name).ok(),
+            integration_ref: scope
+                .integration_ref
+                .clone()
+                .or_else(|| derived_integration(&inventory)),
+            target: Target {
+                name,
+                path: registration.path.clone(),
+                head: registration.head.clone(),
+                branch: registration.branch.clone(),
+            },
         })
     }
-}
-
-impl Default for Service {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Creates one worktree through the Git contract.
-// contract rev 2: switch to git::create(common_dir, spec, budget) at integration
-async fn git_create(
-    common_dir: &Path,
-    spec: &CreateSpec<'_>,
-    op_budget: &Budget,
-) -> Result<git::Created, GitError> {
-    let _ = common_dir;
-    git::create(spec, op_budget).await
-}
-
-/// Removes a worktree record after a confirmed removal.
-// CONTRACT PROPOSAL to the state module: add
-// `store::delete_record(home, repo_id, name, expected_revision) -> Result<(), StoreError>`
-// (revision-checked, mirroring replace_record). Until it lands this shim fails
-// closed with not_implemented and the receipt carries a record_cleanup_failed
-// warning instead of silently losing the record's removal marker.
-fn delete_record(home: &Path, repo_id: &str, name: &str) -> Result<(), StoreError> {
-    let _ = (home, repo_id, name);
-    Err(StoreError::not_implemented())
 }
 
 /// One repository in a resolved scope.
@@ -820,7 +914,9 @@ struct RepoScope {
     repo_id: RepoId,
     common_dir: PathBuf,
     label: String,
-    integration_ref: String,
+    /// Registry-recorded integration ref; `None` when absent or empty, in which
+    /// case observers derive it from the main worktree's branch.
+    integration_ref: Option<String>,
 }
 
 /// A resolved removal or inspection target.
@@ -829,6 +925,31 @@ struct Target {
     path: PathBuf,
     head: Option<String>,
     branch: Option<String>,
+}
+
+/// Best-effort (name, path) identity for an apply replay that found nothing.
+fn replay_target(layout: &Layout, scope: &RepoScope, args: &RemoveArgs) -> (String, PathBuf) {
+    match (&args.name, &args.path) {
+        (Some(name), None) => (
+            name.clone(),
+            layout
+                .root
+                .join(worktree::repo_directory(&scope.label, &scope.repo_id))
+                .join(name),
+        ),
+        (_, Some(path)) => (base_name(Path::new(path)), PathBuf::from(path)),
+        _ => (String::new(), PathBuf::new()),
+    }
+}
+
+/// A target plus facts resolved alongside it.
+struct ResolvedTarget {
+    target: Target,
+    /// The target's name when it parses as a valid `WorktreeName`; records can
+    /// only exist under valid names, so foreign names need no record lookup.
+    valid_name: Option<WorktreeName>,
+    /// Effective integration ref for observation; `None` leaves it unknown.
+    integration_ref: Option<String>,
 }
 
 /// Builds an operation budget with a relative deadline.
@@ -856,10 +977,14 @@ fn base_name(path: &Path) -> String {
 }
 
 /// Builds an observation spec for one worktree path.
-fn observe_spec<'a>(path: &'a Path, integration_ref: &'a str, checks: Checks) -> ObserveSpec<'a> {
+fn observe_spec<'a>(
+    path: &'a Path,
+    integration_ref: Option<&'a str>,
+    checks: Checks,
+) -> ObserveSpec<'a> {
     ObserveSpec {
         worktree_path: path,
-        integration_ref: Some(integration_ref),
+        integration_ref,
         checks,
     }
 }
@@ -876,13 +1001,35 @@ fn known_repo_entry(
         return Ok(entry.clone());
     }
     let label = derive_label(common_dir);
+    // Empty means "not derivable yet"; creation fills it from the main branch.
     Ok(KnownRepo {
         repo_id: repo_id.as_str().to_owned(),
         common_dir: common_dir.to_owned(),
         label,
-        integration_ref: DEFAULT_INTEGRATION_REF.to_owned(),
+        integration_ref: String::new(),
         registered_at: unix_now(),
     })
+}
+
+/// Reads the record for a display name; `None` when the name cannot address a
+/// record (only valid `WorktreeName`s have records) or none is stored.
+fn record_for(home: &Path, repo_id: &RepoId, name: &str) -> Result<Option<Record>, ServiceError> {
+    match WorktreeName::parse(name) {
+        Ok(name) => store::read_record(home, repo_id, &name).map_err(store_error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Derives the integration ref from the main worktree's branch, short form.
+///
+/// `None` when the inventory has no attached main branch (bare or detached);
+/// integration then stays unknown instead of assuming `main`.
+fn derived_integration(inventory: &[crate::worktree::Registration]) -> Option<String> {
+    inventory
+        .iter()
+        .find(|r| r.is_main)
+        .and_then(|r| r.branch.as_deref())
+        .map(|branch| branch.trim_start_matches("refs/heads/").to_owned())
 }
 
 /// Derives a bounded ASCII label from the repository root directory name.
@@ -1195,9 +1342,9 @@ impl CreateArgs {
 impl Record {
     /// Whether a stored record matches a repeated creation request.
     ///
-    /// Only persisted metadata participates: name, base, branch and creator.
-    /// `session`, `purpose` and `ttl` are accepted and validated but cannot be
-    /// compared on replay until the record schema stores them.
+    /// Every persisted intake field participates: base, branch (in the form
+    /// `git::create` reports, without a `refs/heads/` prefix), creator,
+    /// session, purpose and ttl.
     fn matches_request(&self, args: &CreateArgs) -> bool {
         let requested_branch = if args.detached {
             None
@@ -1208,8 +1355,11 @@ impl Record {
             }))
         };
         self.base_ref == args.base
-            && self.branch == requested_branch.map(|b| format!("refs/heads/{b}"))
+            && self.branch == requested_branch
             && self.creator == crate::response::bounded(&args.creator, 64)
+            && self.session == args.session
+            && self.purpose.as_deref() == Some(args.purpose.as_str())
+            && self.ttl_secs == args.ttl
     }
 }
 
@@ -1370,6 +1520,12 @@ pub enum CreateOutcome {
         branch: Option<String>,
         /// Resolved HEAD commit after creation.
         head: String,
+        /// Creator attribution stored in the record.
+        creator: String,
+        /// Purpose stored in the record.
+        purpose: Option<String>,
+        /// Creation time (unix seconds).
+        created_at: u64,
         /// Non-blocking follow-up problems (stable codes).
         warnings: Vec<String>,
     },
@@ -1383,6 +1539,12 @@ pub enum CreateOutcome {
         branch: Option<String>,
         /// HEAD commit at replay time.
         head: Option<String>,
+        /// Creator attribution from the stored record.
+        creator: String,
+        /// Purpose from the stored record.
+        purpose: Option<String>,
+        /// Creation time (unix seconds) from the stored record.
+        created_at: u64,
     },
 }
 
@@ -1403,6 +1565,8 @@ pub struct ListRow {
     pub detached: bool,
     /// HEAD commit when Git reported it.
     pub head: Option<String>,
+    /// Record creator when a record backs the row.
+    pub creator: Option<String>,
     /// On-disk size when requested and measurable.
     pub size: Option<worktree::Size>,
 }
@@ -1560,6 +1724,8 @@ pub struct PruneOutcome {
     pub candidates: Vec<PathBuf>,
     /// Whether pruning was applied.
     pub applied: bool,
+    /// Non-blocking follow-up problems (stable codes).
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1574,7 +1740,7 @@ mod tests {
                 repo_id: RepoId::parse(id).unwrap(),
                 common_dir: PathBuf::from("/x"),
                 label: "repo".to_owned(),
-                integration_ref: "main".to_owned(),
+                integration_ref: Some("main".to_owned()),
             })
             .collect();
         list_scope_digest(&None, true, false, &scopes)
@@ -1637,6 +1803,7 @@ mod tests {
                 branch: Some("refs/heads/aw/x".to_owned()),
                 detached: false,
                 head: None,
+                creator: None,
                 size: None,
             }
         }

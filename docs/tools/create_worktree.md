@@ -21,15 +21,19 @@ branch. Creation registers the repository in the known-repo registry.
 | `purpose` | yes | 1–200 printable single-line characters |
 | `ttl` | no | 60–31 536 000 seconds |
 
-`session`, `purpose` and `ttl` are validated intake metadata; replay comparison
-uses the persisted fields (name, base, branch, creator) until the record schema
-stores them (open contract proposal).
+All intake fields (`base`, `branch`, `creator`, `session`, `purpose`, `ttl`) are
+stored in the record and compared on replay.
 
 ## Behaviour
 
-- `COMMITTED worktree <id12>/<name>` with exact path, branch and HEAD.
+- `COMMITTED worktree <id12>/<name>` with exact path, branch, HEAD, creator,
+  purpose and creation time.
 - Replay with the same persisted metadata: `NOOP`, reconciling against the
   original destination; nothing is recreated or overwritten.
+- `base` combined with an existing `branch` is refused (Git would check the
+  branch out as-is and silently drop the base).
+- The first creation registers the repository, deriving its integration ref
+  from the main worktree's branch; `main` is never assumed.
 - A timeout or lost confirmation after the create is dispatched returns
   `OUTCOME_UNKNOWN` naming the exact destination path to inspect.
 

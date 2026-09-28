@@ -66,9 +66,9 @@ git -C "$repo" worktree add "$dest" && printf '%s\n' "$dest"
 Notes:
 
 - The hook uses `git worktree add` directly, so those trees are `foreign` to
-  this product: listed and inspected, but never auto-deleted.
-- A harness-created tree can be adopted by creating a record through
-  `create_worktree` with the same name and metadata (the current record schema
-  does not adopt an existing directory; a mismatch is a `conflict` by design).
-- Alternatively, let the agent use `create_worktree` instead of the harness
-  feature; the harness then only needs the path that the tool returns.
+  this product: listed and inspected like any registration, and removable only
+  through `remove_worktree` under the same vetoes — never auto-deleted.
+- Adopting an existing harness directory is not supported; `create_worktree`
+  refuses an existing destination by design. Either keep harness-made trees
+  foreign, or let the agent use `create_worktree` instead of the harness
+  feature and hand the returned path back to the harness.

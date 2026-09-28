@@ -103,13 +103,7 @@ fn preview_view(
         eligible,
         veto_count: decision.vetoes.len(),
         vetoes: decision.vetoes.iter().map(veto_view).collect(),
-        warnings: response::join_warnings(
-            &decision
-                .warnings
-                .iter()
-                .map(|w| format!("{w:?}"))
-                .collect::<Vec<_>>(),
-        ),
+        warnings: response::warning_line(&decision.warnings),
         fingerprint: decision
             .fingerprint
             .as_ref()
@@ -266,7 +260,7 @@ mod tests {
         let result = call(
             serde_json::json!({"repo":"/repo","mode":"preview","nope":1}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));
@@ -279,7 +273,7 @@ mod tests {
         let result = call(
             serde_json::json!({"repo":"/repo","name":"task-1","mode":"force"}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));
@@ -292,7 +286,7 @@ mod tests {
         let result = call(
             serde_json::json!({"repo":"/repo","name":"task-1","mode":"apply"}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));
@@ -305,7 +299,7 @@ mod tests {
         let result = call(
             serde_json::json!({"repo":"/repo","mode":"preview"}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));

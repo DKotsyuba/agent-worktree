@@ -28,4 +28,5 @@ applied prune still emits a Rust-side `COMMITTED` receipt.
 - `invalid_arguments`, `repo_path_invalid`, `not_a_repository`.
 - `OUTCOME_UNKNOWN` naming the common directory when an applied prune loses
   confirmation; reconcile before retrying.
-- `not_implemented` until the Git module lands.
+- After an applied prune, records bound to pruned paths are deleted under the
+  repository lock; failures surface as `record_cleanup_failed` warnings.

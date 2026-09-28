@@ -25,6 +25,7 @@ struct View {
     applied: bool,
     rows: Vec<String>,
     listing_refused: bool,
+    warnings: Option<String>,
     total: usize,
 }
 
@@ -50,6 +51,7 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
         repo_id,
         candidates,
         applied,
+        warnings,
     } = match service.prune_worktrees(&parsed).await {
         Ok(outcome) => outcome,
         Err(error) => return response::failure(templates, &error),
@@ -74,6 +76,7 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
         applied,
         rows,
         listing_refused,
+        warnings: response::join_warnings(&warnings),
         total,
     };
     match templates.render("prune_worktrees", &view, Class::Page) {
@@ -117,6 +120,7 @@ mod tests {
             applied: false,
             rows: vec!["/tmp/w/demo--0123456789ab/old-task".to_owned()],
             listing_refused: false,
+            warnings: None,
             total: 1,
         };
         let text = templates()
@@ -137,6 +141,7 @@ mod tests {
             applied: false,
             rows: Vec::new(),
             listing_refused: true,
+            warnings: None,
             total: 25,
         };
         let text = templates()
@@ -151,7 +156,7 @@ mod tests {
         let result = call(
             serde_json::json!({"repo":"/repo","dry_run":true,"nope":1}),
             &templates(),
-            &Service::new(),
+            &Service::new().unwrap(),
         )
         .await;
         assert_eq!(result.is_error, Some(true));

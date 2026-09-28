@@ -224,6 +224,29 @@ pub fn join_warnings(warnings: &[String]) -> Option<String> {
     }
 }
 
+/// One advisory warning as a stable display label.
+#[must_use]
+pub fn warning_label(warning: &crate::worktree::Warning) -> String {
+    use crate::worktree::Warning;
+    match warning {
+        Warning::SizeAtLeast { bytes } => format!("size_at_least {}", human_bytes(*bytes)),
+        Warning::Unmerged => "unmerged".to_owned(),
+        Warning::IntegrationUnknown => "integration_unknown".to_owned(),
+        Warning::ProbeIncomplete { reason } => {
+            format!("probe_incomplete ({})", bounded(reason, 80))
+        }
+        Warning::RemovalStarted => "removal_started".to_owned(),
+        Warning::RecordMismatch => "record_mismatch".to_owned(),
+    }
+}
+
+/// Joins typed warnings into one bounded display line.
+#[must_use]
+pub fn warning_line(warnings: &[crate::worktree::Warning]) -> Option<String> {
+    let labels: Vec<String> = warnings.iter().map(warning_label).collect();
+    join_warnings(&labels)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "Test assertions")]
 mod tests {

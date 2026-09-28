@@ -40,4 +40,6 @@ already collected. Degraded probes keep the reply a successful read.
   `name_charset`, `path_invalid`, `repo_path_invalid`.
 - `not_found` — no Git registration matches; orphan directories are not
   inspectable because Git owns the registration facts.
-- `not_a_repository`, `not_implemented` (state module).
+- `not_a_repository`.
+- `record_mismatch` warning when a stored record disagrees with the observed
+  worktree identity or bound path; the record is ignored for that decision.

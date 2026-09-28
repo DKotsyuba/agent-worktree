@@ -30,12 +30,16 @@ not an execution error; apply is only meaningful when eligible.
 
 ## Apply
 
-Acquires the repository lock, re-observes, reassesses with the expected
-fingerprint and refuses on any veto or divergence. On success it writes
-`removal_started` before dispatching `git worktree remove`, then returns
-`COMMITTED` (or `NOOP` when already absent) with the retained branch. The
-receipt is rendered from Rust if the template fails; a lost confirmation after
-dispatch returns `OUTCOME_UNKNOWN` naming the exact path to inspect.
+Acquires the repository lock, re-observes with status checks immediately
+before dispatch (Git removes an ignored-only worktree without `--force`, so the
+fresh `ignored_not_disposable` veto is the only guard), reassesses with the
+expected fingerprint and refuses on any veto or divergence. On success it
+writes `removal_started` before dispatching `git worktree remove`, deletes the
+record, then returns `COMMITTED` (or `NOOP` when already absent — including a
+replayed apply whose worktree and registration are already gone) with the
+retained branch. Foreign worktrees without records skip the marker and delete.
+The receipt is rendered from Rust if the template fails; a lost confirmation
+after dispatch returns `OUTCOME_UNKNOWN` naming the exact path to inspect.
 
 ## Refusals (`ERROR …`, no effect)
 

@@ -2,17 +2,15 @@
 mod response;
 mod service;
 mod tools;
-// Frozen shared contracts for parallel module work. Each dead-code allowance is
-// removed when its owning module is implemented. The Git module is implemented,
-// but nothing calls it until the service wiring lands; the allowance below dies
-// with the first src/service.rs call site.
-#[allow(
-    dead_code,
-    reason = "Implemented git.rs, not yet reachable from main; remove with service wiring"
-)]
+// The contract modules keep a few API surfaces no current call site constructs
+// (unused `NotImplemented` codes, `Probe::Incomplete`); they belong to those
+// modules, so the lint is allowed here until their owners trim them.
+#[allow(dead_code, reason = "Unused contract surface in git/store/worktree")]
 mod git;
-pub mod store;
-pub mod worktree;
+#[allow(dead_code, reason = "Unused contract surface in git/store/worktree")]
+mod store;
+#[allow(dead_code, reason = "Unused contract surface in git/store/worktree")]
+mod worktree;
 use clap::{Parser, Subcommand};
 use mcp_presentation::Renderer;
 use rmcp::{
@@ -81,7 +79,7 @@ impl Handler {
     fn new() -> Result<Self, &'static str> {
         let identity = Renderer::new().map_err(|_| "presentation_setup_failed")?;
         let templates = response::Templates::new(&tools::templates())?;
-        let service = Arc::new(service::Service::new());
+        let service = Arc::new(service::Service::new().map_err(|_| "policy_invalid")?);
         let catalog = serde_json::from_value(serde_json::Value::Array(tools::definitions()))
             .map_err(|_| "catalog_invalid")?;
         Ok(Self {

@@ -37,17 +37,26 @@ from working files and Git administration directories.
 Worktree record, schema v1 (`src/worktree.rs` `Record`, `deny_unknown_fields`):
 `schema_version`, `repo_id`, `name`, bound `path`, `branch`, optional
 `base_ref`/`base_oid`, `created_at`, `creator` (attribution, not
-authentication), `revision`, and optional `removal_started {fingerprint, at}`.
+authentication), optional `session`, `purpose` (≤ 200 chars) and `ttl_secs`
+(unenforced metadata), `revision`, and optional `removal_started
+{fingerprint, at}`. The intake fields all participate in create-replay
+comparison: same name and same metadata is a no-op, different metadata a
+conflict.
 
 - Writes are atomic replacements capped at 8 KiB.
 - A per-repository advisory file lock (via `fs2`) serializes cooperating
-  CLI/MCP processes; it cannot stop a foreign process.
+  CLI/MCP processes; it cannot stop a foreign process. Mutating store calls
+  take the lock guard as type-level proof of holding it.
 - Every write is revision-checked: the caller states the observed `revision`,
   the write stores `revision + 1`, and a moved revision is a conflict.
 - `removal_started` is written before a removal is dispatched, so an
-  interrupted removal stays visible after a restart.
-- A known-repo registry in the same directory maps identity → common dir, label
-  and integration ref; `create` records repositories there.
+  interrupted removal stays visible after a restart; a completed removal and a
+  pruned registration delete their records.
+- A known-repo registry at `<home>/state/v1/registry.json` (schema-versioned
+  JSON, entries sorted by identity, capped at 64 KiB, guarded by a dedicated
+  registry lock) maps identity → common dir, label and integration ref;
+  `create` records repositories there. The integration ref is derived at first
+  registration from the main worktree's branch — `main` is never assumed.
 - There is no operation journal, no stored removal plans, no pagination
   snapshots and no SQLite. Replays are decided from Git plus the record.
 
@@ -188,6 +197,3 @@ stateful delivery profile lands, installation is from local builds only.
 | `src/store.rs` | layout/config resolution, per-repo lock, revision-checked record writes, known-repo registry, discovery |
 | `src/tools/*`, `src/response.rs`, `src/main.rs` | MCP tool surface, rendering, wiring |
 
-Currently the contract modules exist with substitute bodies that fail closed
-(`not_implemented` errors; removal always refused; classification unknown), and
-the tool surface beyond `get_status` is not yet registered.

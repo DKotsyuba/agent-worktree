@@ -24,6 +24,9 @@ struct View {
     path: String,
     branch: String,
     head: String,
+    creator: String,
+    purpose: String,
+    created_at: u64,
     warnings: Option<String>,
 }
 
@@ -69,6 +72,9 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
             path,
             branch,
             head,
+            creator,
+            purpose,
+            created_at,
             warnings,
         }) => {
             let path_text = path.display().to_string();
@@ -76,6 +82,12 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
             let view = View {
                 status: "COMMITTED",
                 warnings: response::join_warnings(&warnings),
+                creator: creator.clone(),
+                purpose: purpose
+                    .as_deref()
+                    .map(|p| response::bounded(p, 120))
+                    .unwrap_or_else(|| "-".to_owned()),
+                created_at,
                 key,
                 path: path_text.clone(),
                 branch: branch_text.clone(),
@@ -94,10 +106,19 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
             path,
             branch,
             head,
+            creator,
+            purpose,
+            created_at,
         }) => {
             let view = View {
                 status: "NOOP",
                 warnings: None,
+                creator,
+                purpose: purpose
+                    .as_deref()
+                    .map(|p| response::bounded(p, 120))
+                    .unwrap_or_else(|| "-".to_owned()),
+                created_at,
                 key,
                 path: path.display().to_string(),
                 branch: branch_label(&branch),
@@ -137,7 +158,7 @@ mod tests {
     async fn unknown_field_rejected() {
         let mut args = base_args();
         args["unexpected"] = json!(true);
-        let result = call(args, &templates(), &Service::new()).await;
+        let result = call(args, &templates(), &Service::new().unwrap()).await;
         assert_eq!(result.is_error, Some(true));
         let text = crate::response::first_text(&result);
         assert!(text.starts_with("ERROR invalid_arguments:"), "{text}");
@@ -147,7 +168,7 @@ mod tests {
     async fn missing_required_field_rejected() {
         let mut args = base_args();
         args.as_object_mut().unwrap().remove("purpose");
-        let result = call(args, &templates(), &Service::new()).await;
+        let result = call(args, &templates(), &Service::new().unwrap()).await;
         assert_eq!(result.is_error, Some(true));
         let text = crate::response::first_text(&result);
         assert!(text.starts_with("ERROR invalid_arguments:"), "{text}");
@@ -157,18 +178,20 @@ mod tests {
     async fn bad_name_refused_before_any_effect() {
         let mut args = base_args();
         args["name"] = json!("Bad_Name");
-        let result = call(args, &templates(), &Service::new()).await;
+        let result = call(args, &templates(), &Service::new().unwrap()).await;
         assert_eq!(result.is_error, Some(true));
         let text = crate::response::first_text(&result);
         assert!(text.starts_with("ERROR name_charset:"), "{text}");
     }
 
     #[tokio::test]
-    async fn valid_arguments_reach_the_service_and_fail_closed() {
-        let result = call(base_args(), &templates(), &Service::new()).await;
+    async fn valid_arguments_reach_the_service() {
+        // A nonexistent repository path is refused by Git, proving the call
+        // reaches the real Git contract end to end.
+        let result = call(base_args(), &templates(), &Service::new().unwrap()).await;
         assert_eq!(result.is_error, Some(true));
         let text = crate::response::first_text(&result);
-        assert!(text.starts_with("ERROR not_implemented:"), "{text}");
+        assert!(text.starts_with("ERROR not_a_repository:"), "{text}");
     }
 
     #[test]
@@ -177,8 +200,11 @@ mod tests {
             status: "COMMITTED",
             key: "0123456789ab/task-1".to_owned(),
             path: "/tmp/w/demo--0123456789ab/task-1".to_owned(),
-            branch: "refs/heads/aw/task-1".to_owned(),
+            branch: "aw/task-1".to_owned(),
             head: "0f1e2d3c4b5a6978879665544332211ff1e2d3c4".to_owned(),
+            creator: "claude-code".to_owned(),
+            purpose: "ship the release".to_owned(),
+            created_at: 1_800_000_000,
             warnings: None,
         };
         let text = templates()

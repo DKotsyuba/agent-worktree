@@ -33,7 +33,9 @@ invalidate, and the response never claims a stable total.
 ## Reply
 
 `OK` (or `PARTIAL` when one repository's inventory failed — the reply stays a
-successful read and names the failure in `Coverage:`), one line per row, one
+successful read and names the failure in `Coverage:`), one line per row
+(`key | class | branch | creator | size | path`; creator is `-` for foreign and
+missing rows), one
 hygiene line `missing=… orphan_candidates=… removal_started=…` computed only
 from data this call already collected, a `Coverage:` line, and `Cursor:` when
 more rows remain. A page that cannot fit a single row refuses with
@@ -43,5 +45,4 @@ exceed the budget is shrunk, which is safe under keyset order.
 ## Refusals (`ERROR …`)
 
 - `invalid_arguments`, `limit_out_of_range`, `cursor_invalid`,
-  `cursor_scope_mismatch`, `repo_path_invalid`.
-- `not_implemented` until the state module lands.
+  `cursor_scope_mismatch`, `repo_path_invalid`, `not_a_repository`.
