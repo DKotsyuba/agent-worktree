@@ -581,6 +581,64 @@ async fn removal_vetoes_fingerprint_apply_and_replay() {
 }
 
 #[tokio::test]
+async fn removing_the_last_worktree_cleans_the_repo_directory() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let repo = f.repo.display().to_string();
+
+        // Two managed worktrees under one per-repository directory.
+        let mut paths = Vec::new();
+        for name in ["task-1", "task-2"] {
+            let (error, text) = call_text(
+                &f._client,
+                "create_worktree",
+                serde_json::json!({"repo": repo, "name": name, "creator": "e2e",
+                    "purpose": "repo directory cleanup"}),
+            )
+            .await;
+            assert!(!error, "{text}");
+            paths.push(field(&text, "Path").to_owned());
+        }
+        let repo_dir = std::path::Path::new(&paths[0]).parent().unwrap().to_owned();
+
+        // Removing one of two keeps the directory; removing the last one
+        // removes the now-empty directory with it.
+        for (index, name) in ["task-1", "task-2"].iter().enumerate() {
+            let (error, preview) = call_text(
+                &f._client,
+                "remove_worktree",
+                serde_json::json!({"repo": repo, "name": name, "mode": "preview"}),
+            )
+            .await;
+            assert!(!error, "{preview}");
+            assert!(preview.contains("Eligible: true (0 vetoes)"), "{preview}");
+            let fingerprint = field(&preview, "Fingerprint").to_owned();
+            let (error, receipt) = call_text(
+                &f._client,
+                "remove_worktree",
+                serde_json::json!({"repo": repo, "name": name, "mode": "apply",
+                    "fingerprint": fingerprint}),
+            )
+            .await;
+            assert!(!error, "{receipt}");
+            assert!(
+                receipt.starts_with("COMMITTED remove_worktree "),
+                "{receipt}"
+            );
+            assert!(
+                !std::path::Path::new(&paths[index]).exists(),
+                "tree removed"
+            );
+            assert_eq!(repo_dir.exists(), index == 0, "iteration {index}");
+        }
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
 async fn unmerged_and_foreign_removal_rules() {
     let f = fixture().await;
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -1021,6 +1079,17 @@ async fn apply_replay_by_aliased_path_deletes_a_crashed_removals_record() {
         let path = field(&text, "Path").to_owned();
         let repo_dir = std::path::Path::new(&path).parent().unwrap().to_owned();
 
+        // A second managed worktree keeps the per-repository directory alive
+        // through alias-task's removal, so the aliased replay below can still
+        // resolve its parent through the symlink.
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "keeper", "creator": "e2e",
+                "purpose": "keeps the repo directory"}),
+        )
+        .await;
+        assert!(!error, "{text}");
         // Simulate a crashed removal: remember the record, apply a clean
         // removal by name, then resurrect the record with a removal_started
         // marker on it.

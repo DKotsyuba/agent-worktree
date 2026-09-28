@@ -42,6 +42,10 @@ also deletes a crashed removal's leftover `removal_started` record under the
 lock — the caller path is canonicalized first, so a path-form replay through a
 `/var`-style alias still matches the record's bound path — warning
 `record_cleanup_pending` if that fails) with the retained branch. Foreign worktrees without records skip the marker and delete.
+When the removed tree lived directly inside the configured root, apply also
+removes the now-empty per-repository directory `<root>/<label>--<id12>` with a
+non-recursive `remove_dir` that never touches the root itself; a failure is the
+warning `repo_dir_cleanup_failed`, never an error.
 The receipt is rendered from Rust if the template fails; a lost confirmation
 after dispatch returns `OUTCOME_UNKNOWN` naming the exact path to inspect.
 

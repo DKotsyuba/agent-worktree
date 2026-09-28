@@ -1119,6 +1119,24 @@ impl Service {
         {
             warnings.push(format!("record_cleanup_failed: {}", error.code.as_str()));
         }
+        // With its last worktree gone, the per-repository directory under the
+        // root is empty; remove it when the removed tree really lived inside
+        // it. The root itself is never a candidate, `std::fs::remove_dir`
+        // refuses non-empty directories (never recursive), and any failure is
+        // a warning, never an error.
+        if let Some(root) = &layout.root {
+            let repo_dir = root.join(worktree::repo_directory(&scope.label, &scope.repo_id));
+            if repo_dir != *root
+                && repo_dir.starts_with(root)
+                && repo_dir.try_exists().unwrap_or(false)
+                && path
+                    .parent()
+                    .is_some_and(|parent| canonical_path(parent) == canonical_path(&repo_dir))
+                && let Err(error) = std::fs::remove_dir(&repo_dir)
+            {
+                warnings.push(format!("repo_dir_cleanup_failed: {error}"));
+            }
+        }
         Ok(RemoveOutcome::Applied {
             key,
             path,
@@ -2261,7 +2279,7 @@ pub struct ListOutcome {
     pub cursor: Option<String>,
     /// Scope coverage facts.
     pub coverage: Coverage,
-    /// Hygiene counts over the full collected scope.
+    /// Hygiene counts over exactly the rows this page collected.
     pub hygiene: Hygiene,
 }
 

@@ -24,7 +24,9 @@ product state only adds what cannot be reconstructed from Git.
   identity and requires explicit rebinding.
 - Per-repository directory: `<root>/<label>--<id12>/`, where `label` is bounded
   ASCII (1–32 of `[a-z0-9.-]`, no leading hyphen or dot) and `id12` is the first
-  12 identity characters. Identity never depends on the label.
+  12 identity characters. Identity never depends on the label. An apply removal
+  deletes this directory too once its last worktree is gone — only when it is
+  empty and inside the root, never the root itself.
 - Worktree directory: `<root>/<label>--<id12>/<name>/`. The name is
   caller-supplied: 1–64 characters of `[a-z0-9-]`, no leading hyphen.
 - Default branch: `aw/<name>`. An explicit existing branch or a detached checkout
