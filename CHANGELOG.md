@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.1
+
 ### Added
 
 - Worktree creation under `<root>/<label>--<id12>/<name>` on branch `aw/<name>`
