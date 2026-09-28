@@ -1,0 +1,14 @@
+PREVIEW remove_worktree {{ key }}
+Path: {{ path }}
+Head: {{ head }}
+Branch: {{ branch }}
+Disposable: {{ disposable }}
+Eligible: {{ eligible }} ({{ veto_count }} vetoes)
+{% for veto in vetoes %}
+Veto: {{ veto.code }}{{ veto.detail }}
+{% endfor %}
+{% if warnings %}
+Warnings: {{ warnings }}
+{% endif %}
+Fingerprint: {{ fingerprint }}
+Next: {{ next }}

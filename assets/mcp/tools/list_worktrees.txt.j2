@@ -1,0 +1,9 @@
+{{ status }} worktrees: {{ returned }} returned; more={{ has_more }}
+{% for row in rows %}
+{{ row.key }} | {{ row.class }} | {{ row.branch }} | {{ row.size }} | {{ row.path }}
+{% endfor %}
+Hygiene: {{ hygiene }}
+Coverage: {{ coverage }}
+{% if cursor %}
+Cursor: {{ cursor }}
+{% endif %}

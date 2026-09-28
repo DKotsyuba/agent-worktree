@@ -1,5 +1,6 @@
 //! Rust MCP application; protocol, presentation and deployment have separate boundaries.
 mod response;
+mod service;
 mod tools;
 // Frozen shared contracts for parallel module work. Each dead-code allowance is
 // removed when its owning module is implemented.
@@ -79,17 +80,20 @@ enum ReleaseCommand {
 struct Handler {
     identity: Arc<Renderer>,
     templates: Arc<response::Templates>,
+    service: Arc<service::Service>,
     catalog: Vec<Tool>,
 }
 impl Handler {
     fn new() -> Result<Self, &'static str> {
         let identity = Renderer::new().map_err(|_| "presentation_setup_failed")?;
         let templates = response::Templates::new(&tools::templates())?;
+        let service = Arc::new(service::Service::new());
         let catalog = serde_json::from_value(serde_json::Value::Array(tools::definitions()))
             .map_err(|_| "catalog_invalid")?;
         Ok(Self {
             identity: Arc::new(identity),
             templates: Arc::new(templates),
+            service,
             catalog,
         })
     }
@@ -116,9 +120,15 @@ impl ServerHandler for Handler {
         _: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
-        let reply = tools::call(&request.name, args, &self.identity, &self.templates)
-            .await
-            .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "Unknown tool", None))?;
+        let reply = tools::call(
+            &request.name,
+            args,
+            &self.identity,
+            &self.templates,
+            &self.service,
+        )
+        .await
+        .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "Unknown tool", None))?;
         Ok(reply.into())
     }
 }

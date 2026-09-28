@@ -33,6 +33,7 @@ async fn protocol() {
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("../schemas/tools.json")).unwrap();
         assert_eq!(serde_json::to_value(&listed.tools).unwrap(), expected);
+        assert_eq!(listed.tools.len(), 6);
         let result = client
             .call_tool(CallToolRequestParams::new("get_status"))
             .await
@@ -40,6 +41,28 @@ async fn protocol() {
         let wire = serde_json::to_value(result).unwrap();
         assert_eq!(wire["isError"], false);
         assert_eq!(wire["content"].as_array().unwrap().len(), 1);
+        // Tool surface is wired end to end: a strict-arguments read tool
+        // executes and fails closed through the frozen store contract.
+        let listed_page = client
+            .call_tool(CallToolRequestParams::new("list_worktrees"))
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(listed_page).unwrap();
+        assert_eq!(wire["isError"], true);
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("ERROR not_implemented:"), "{text}");
+        let bad_tool_args = serde_json::json!({"repo":"/repo","limit":0})
+            .as_object()
+            .unwrap()
+            .clone();
+        let refused = client
+            .call_tool(CallToolRequestParams::new("list_worktrees").with_arguments(bad_tool_args))
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(refused).unwrap();
+        assert_eq!(wire["isError"], true);
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("ERROR limit_out_of_range:"), "{text}");
         let args = serde_json::json!({"unexpected":true})
             .as_object()
             .unwrap()

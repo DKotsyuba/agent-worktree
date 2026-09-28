@@ -1,0 +1,19 @@
+OK worktree {{ key }} ({{ class }})
+Path: {{ path }}
+Head: {{ head }}
+Branch: {{ branch }}
+Activity: {{ activity }}
+Integration: {{ integration }}
+Status: {{ status }}
+Submodules: {{ submodules }}
+Processes: {{ processes }}
+Size: {{ size }}
+Locked: {{ locked }}
+{% if removal_started %}
+Removal started: {{ removal_started }}
+{% endif %}
+{% if warnings %}
+Warnings: {{ warnings }}
+{% endif %}
+Hygiene: {{ hygiene }}
+Observed: {{ observed_at }}

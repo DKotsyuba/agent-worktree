@@ -1,0 +1,14 @@
+OK worktree 0123456789ab/task-1 (managed)
+Path: /tmp/w/demo--0123456789ab/task-1
+Head: 0f1e2d3c4b5a6978879665544332211ff1e2d3c4
+Branch: refs/heads/aw/task-1
+Activity: stale_candidate
+Integration: unmerged
+Status: staged=0 unstaged=0 untracked=2 conflicts=0 ignored=1
+Submodules: not checked
+Processes: none
+Size: not checked
+Locked: -
+Warnings: unmerged
+Hygiene: stale_activity=true large=false missing=false
+Observed: 1800000000

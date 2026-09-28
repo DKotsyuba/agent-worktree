@@ -1,13 +1,260 @@
 [
   {
-    "name": "get_status",
-    "description": "Report the product identity and scaffold qualification status. Read-only; does not access files or external services.",
-    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
     "annotations": {
-      "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": false
-    }
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report the product identity and scaffold qualification status. Read-only; does not access files or external services.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "get_status"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Create one Git worktree under the managed root and record it. External write: creates a directory and a branch (default aw/<name>), never resets an existing branch. A repeated identical request is a no-op; any conflict refuses without overwriting.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "description": "Base ref or commit; repository HEAD when omitted.",
+          "maxLength": 200,
+          "type": "string"
+        },
+        "branch": {
+          "description": "Existing branch to check out; mutually exclusive with detached.",
+          "maxLength": 200,
+          "type": "string"
+        },
+        "creator": {
+          "description": "Creating harness attribution.",
+          "maxLength": 64,
+          "type": "string"
+        },
+        "detached": {
+          "description": "Check out base detached instead of a branch.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Worktree name.",
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "type": "string"
+        },
+        "purpose": {
+          "description": "Why the worktree exists.",
+          "maxLength": 200,
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository root or any worktree inside it.",
+          "type": "string"
+        },
+        "session": {
+          "description": "Creating session identifier.",
+          "maxLength": 128,
+          "type": "string"
+        },
+        "ttl": {
+          "description": "Advisory lifetime in seconds.",
+          "maximum": 31536000,
+          "minimum": 60,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "repo",
+        "name",
+        "creator",
+        "purpose"
+      ],
+      "type": "object"
+    },
+    "name": "create_worktree"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List Git worktree registrations across the managed scope with ownership classification (managed, foreign, missing, orphan_candidate). Read-only. Keyset-paginated, at most 20 rows per page; orphan candidates are never automatically deletable.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "description": "Cursor from the previous page.",
+          "type": "string"
+        },
+        "discovery": {
+          "description": "Also scan configured discovery roots; default true.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Rows per page; default 20.",
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repo": {
+          "description": "Restrict the scope to one repository; omit for all known repositories.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Measure on-disk size of the rows shown on this page; default false.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_worktrees"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Inspect one worktree with bounded probes: activity, integration ancestry, status counts, submodules, live processes and optional size. Read-only. Unknown, unavailable or incomplete checks are reported as such, never as clean.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "checks": {
+          "additionalProperties": false,
+          "description": "Expensive probes to run; when omitted, status, integration and processes run.",
+          "properties": {
+            "integration": {
+              "type": "boolean"
+            },
+            "processes": {
+              "type": "boolean"
+            },
+            "size": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": "boolean"
+            },
+            "submodules": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "name": {
+          "description": "Worktree directory name; provide name or path, not both.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute worktree path; provide name or path, not both.",
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository root or any worktree inside it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "inspect_worktree"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Remove one worktree. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes it under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. An interrupted apply stays visible through the record's removal_started marker.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_unmerged": {
+          "description": "Explicitly allow removing an unmerged worktree; the branch is retained.",
+          "type": "boolean"
+        },
+        "disposable_paths": {
+          "description": "Ignored paths approved for deletion, worktree-relative (for example target/).",
+          "items": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "fingerprint": {
+          "description": "Fingerprint returned by the preview being applied; required for apply.",
+          "maxLength": 64,
+          "type": "string"
+        },
+        "mode": {
+          "description": "preview assesses; apply removes under the preview fingerprint.",
+          "enum": [
+            "preview",
+            "apply"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Worktree directory name; provide name or path, not both.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute worktree path; provide name or path, not both.",
+          "type": "string"
+        },
+        "repo": {
+          "description": "Repository root or any worktree inside it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "name": "remove_worktree"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Prune stale worktree registrations for one repository. dry_run=true (the default) lists missing, unlocked registrations; dry_run=false runs native git worktree prune, which removes registrations only, never branches or existing directories.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "description": "List candidates only; default true.",
+          "type": "boolean"
+        },
+        "repo": {
+          "description": "Repository root or any worktree inside it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "prune_worktrees"
   }
 ]

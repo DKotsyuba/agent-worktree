@@ -1,0 +1,2 @@
+OK prune_worktrees 0123456789ab: 1 registrations; applied=false
+/tmp/w/demo--0123456789ab/old-task
