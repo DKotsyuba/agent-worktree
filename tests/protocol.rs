@@ -25,6 +25,10 @@ async fn protocol() {
             .arg("mcp")
             .env_clear()
             .env("HOME", root.path())
+            .env(
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )
             .current_dir(root.path())
             .kill_on_drop(true)
             .stderr(Stdio::null());
@@ -33,6 +37,7 @@ async fn protocol() {
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("../schemas/tools.json")).unwrap();
         assert_eq!(serde_json::to_value(&listed.tools).unwrap(), expected);
+        assert_eq!(listed.tools.len(), 6);
         let result = client
             .call_tool(CallToolRequestParams::new("get_status"))
             .await
@@ -40,6 +45,30 @@ async fn protocol() {
         let wire = serde_json::to_value(result).unwrap();
         assert_eq!(wire["isError"], false);
         assert_eq!(wire["content"].as_array().unwrap().len(), 1);
+        // The tool surface works end to end: an empty scope lists zero rows.
+        let listed_page = client
+            .call_tool(CallToolRequestParams::new("list_worktrees"))
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(listed_page).unwrap();
+        assert_eq!(wire["isError"], false);
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("OK worktrees: 0 returned; more=false"),
+            "{text}"
+        );
+        let bad_tool_args = serde_json::json!({"repo":"/repo","limit":0})
+            .as_object()
+            .unwrap()
+            .clone();
+        let refused = client
+            .call_tool(CallToolRequestParams::new("list_worktrees").with_arguments(bad_tool_args))
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(refused).unwrap();
+        assert_eq!(wire["isError"], true);
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("ERROR limit_out_of_range:"), "{text}");
         let args = serde_json::json!({"unexpected":true})
             .as_object()
             .unwrap()

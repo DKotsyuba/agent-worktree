@@ -1,0 +1,11 @@
+PREVIEW remove_worktree 0123456789ab/task-1
+Path: /tmp/w/demo--0123456789ab/task-1
+Head: 0f1e2d3c4b5a6978879665544332211ff1e2d3c4
+Branch: refs/heads/aw/task-1
+Disposable: target/
+Eligible: false (2 vetoes)
+Veto: dirty
+Veto: ignored_not_disposable (dist/, node_modules/)
+Warnings: unmerged
+Fingerprint: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+Next: resolve the vetoes above, then rerun the preview.
