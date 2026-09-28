@@ -1,5 +1,6 @@
 /target/
 /dist/
+/.worktrees/
 /.initializing
 *.rs.bk
 .DS_Store

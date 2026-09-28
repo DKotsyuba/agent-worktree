@@ -10,7 +10,7 @@ qualification = "not_verified"
 
 [profiles]
 process = "in-process"
-state = "none"
+state = "local"
 transports = ["stdio"]
 host_adapter = false
 

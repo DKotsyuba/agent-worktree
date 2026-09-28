@@ -13,6 +13,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

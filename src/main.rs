@@ -1,6 +1,23 @@
 //! Rust MCP application; protocol, presentation and deployment have separate boundaries.
 mod response;
 mod tools;
+// Frozen shared contracts for parallel module work. Each dead-code allowance is
+// removed when its owning module is implemented.
+#[allow(
+    dead_code,
+    reason = "Frozen git.rs contract; removed when the Git module is implemented"
+)]
+mod git;
+#[allow(
+    dead_code,
+    reason = "Frozen store.rs contract; removed when the state module is implemented"
+)]
+mod store;
+#[allow(
+    dead_code,
+    reason = "Frozen worktree.rs contract; removed when the policy module is implemented"
+)]
+mod worktree;
 use clap::{Parser, Subcommand};
 use mcp_presentation::Renderer;
 use rmcp::{
