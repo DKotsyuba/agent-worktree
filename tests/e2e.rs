@@ -200,6 +200,58 @@ fn field<'a>(text: &'a str, label: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing {label} line in:\n{text}"))
 }
 
+/// Runs `hook context` with an isolated product home and captures stdout.
+fn hook_context(home: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
+    let mut command = Command::new(binary());
+    command
+        .args(["hook", "context", "--host", "claude"])
+        .env_clear()
+        .env("HOME", home)
+        .env("AGENT_WORKTREE_HOME", home.join("product"))
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        )
+        .current_dir(home);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook must always exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Rewrites notify.json with `last_scan_at = 0` so the next run rescans.
+fn clear_last_scan(home: &std::path::Path) {
+    let path = home.join("product/state/v1/notify.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    state["last_scan_at"] = serde_json::json!(0);
+    std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+}
+
+/// Runs the hook until it prints. Under parallel test load a debug-build scan
+/// can miss its 3 s deadline and stay silent by design, so retries with the
+/// state file removed and a pause between attempts absorb that (deadline
+/// misses never leave a usable scan); a hook that never prints fails here.
+fn hook_context_prints(home: &std::path::Path, attempts: usize) -> String {
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let stdout = hook_context(home, &[]);
+        if !stdout.trim().is_empty() {
+            return stdout;
+        }
+        let _ = std::fs::remove_file(home.join("product/state/v1/notify.json"));
+    }
+    panic!("hook context printed nothing after {attempts} attempts");
+}
+
 /// One prepared fixture: temp home, committed repo, spawned client.
 struct Fixture {
     // Order matters: drop order keeps dirs alive for the whole test.
@@ -1052,6 +1104,105 @@ async fn prune_preview_paginates_oversized_candidate_lists() {
         assert!(applied.contains("22 candidates; showing 22"), "{applied}");
 
         f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
+async fn hook_context_notifies_once_per_idle_episode() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        init_repo(&repo);
+        std::fs::create_dir_all(home.path().join("product")).unwrap();
+        std::fs::write(
+            home.path().join("product/config.toml"),
+            format!("[discovery]\nroots = [\"{}\"]\n", home.path().display()),
+        )
+        .unwrap();
+        let wt = home.path().join("wt-old");
+        git(
+            &repo,
+            &["worktree", "add", "--quiet", &wt.display().to_string()],
+        );
+        age_worktree(&repo.join(".git").join("worktrees").join("wt-old"), 2);
+        // The main checkout is even older: it must never be notified.
+        age_worktree(&repo.join(".git"), 40);
+
+        // First crossing: exactly one row, for the aged linked worktree.
+        let envelope: serde_json::Value =
+            serde_json::from_str(hook_context_prints(home.path(), 6).trim()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        let text = envelope["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        let canonical = std::fs::canonicalize(&wt).unwrap();
+        // Mergedness may degrade to `unknown` under the hook's deadline; the
+        // row identity must not.
+        assert!(
+            text.starts_with(
+                "<agent-worktree>\n1 worktree(s) have had no activity for over 24 h:\n- repo/wt-old — idle 2 d, "
+            ),
+            "{text}"
+        );
+        let label = text
+            .lines()
+            .nth(2)
+            .and_then(|row| row.split(", ").nth(1))
+            .unwrap_or_default();
+        assert!(
+            ["merged", "unmerged", "unknown"].contains(&label),
+            "mergedness label: {label}"
+        );
+        assert!(
+            text.contains(canonical.display().to_string().as_str()),
+            "{text}"
+        );
+        assert!(text.ends_with(
+            "Review: list_worktrees; remove: remove_worktree preview → apply.\n</agent-worktree>"
+        ));
+        assert!(text.lines().count() <= 12, "{text}");
+        assert!(text.len() <= 1536, "{text}");
+
+        // The state records the episode, so a rescan stays silent…
+        assert_eq!(hook_context(home.path(), &[]), "");
+        // …inside the rate-limit window and after it.
+        clear_last_scan(home.path());
+        assert_eq!(hook_context(home.path(), &[]), "");
+
+        // A delegated agent-run child never prints, even on a fresh window.
+        clear_last_scan(home.path());
+        assert_eq!(
+            hook_context(home.path(), &[("AGENT_RUN_WORKER_HOME", "/run/home")]),
+            ""
+        );
+
+        // Activity closes the episode; idle again opens a new one. The fresh
+        // commit is off main, so the second block reports unmerged.
+        git(&wt, &["commit", "--quiet", "--allow-empty", "-m", "fresh"]);
+        clear_last_scan(home.path());
+        assert_eq!(hook_context(home.path(), &[]), "");
+        age_worktree(&repo.join(".git").join("worktrees").join("wt-old"), 2);
+        clear_last_scan(home.path());
+        let envelope: serde_json::Value =
+            serde_json::from_str(hook_context_prints(home.path(), 6).trim()).unwrap();
+        let text = envelope["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("1 worktree(s) have had no activity"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- repo/wt-old — idle 2 d, merged, ")
+                || text.contains("- repo/wt-old — idle 2 d, unmerged, ")
+                || text.contains("- repo/wt-old — idle 2 d, unknown, "),
+            "{text}"
+        );
     })
     .await
     .expect("e2e deadline");

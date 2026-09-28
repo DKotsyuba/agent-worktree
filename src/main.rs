@@ -1,4 +1,5 @@
 //! Rust MCP application; protocol, presentation and deployment have separate boundaries.
+mod notify;
 mod response;
 mod service;
 mod tools;
@@ -55,6 +56,46 @@ enum Commands {
         #[command(subcommand)]
         command: ReleaseCommand,
     },
+    /// Host hook surface: context injection for `UserPromptSubmit`.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+}
+
+/// Host hook subcommands.
+#[derive(Subcommand)]
+enum HookCommand {
+    /// Print idle-worktree context for a `UserPromptSubmit` hook.
+    ///
+    /// Always exits 0 and prints nothing on any internal error; emits one
+    /// bounded `<agent-worktree>` block per new 24 h idle episode,
+    /// rate-limited to one scan per 10 minutes.
+    Context {
+        /// Host harness the hook runs under. Both hosts consume the same
+        /// `additionalContext` JSON envelope `agent-run hook context` emits.
+        #[arg(long, default_value = "claude")]
+        host: Host,
+    },
+}
+
+/// Host harness selection for `hook context`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Host {
+    /// Claude Code.
+    Claude,
+    /// Codex.
+    Codex,
+}
+
+impl Host {
+    /// Stable lowercase name used in hook diagnostics.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
 }
 #[derive(Subcommand)]
 enum ContractCommand {
@@ -140,6 +181,23 @@ fn print_json(value: impl serde::Serialize) -> ExitCode {
         }
     }
 }
+
+/// Prints one `UserPromptSubmit` context envelope, mirroring the shape
+/// `agent-run hook context` emits for both Claude Code and Codex; an empty
+/// `text` prints nothing at all.
+#[allow(
+    clippy::print_stdout,
+    reason = "Explicit hook branch, never MCP output"
+)]
+fn print_context(text: &str) {
+    let envelope = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text
+        }
+    });
+    println!("{envelope}");
+}
 #[tokio::main]
 async fn main() -> ExitCode {
     match Cli::parse().command {
@@ -188,6 +246,16 @@ async fn main() -> ExitCode {
         Commands::Contract {
             command: ContractCommand::Readiness,
         } => print_json(tools::incomplete()),
+        Commands::Hook {
+            command: HookCommand::Context { host },
+        } => {
+            // The hook must never break the host: every outcome is a silent exit 0.
+            let text = notify::hook_context(host.as_str()).await;
+            if !text.is_empty() {
+                print_context(&text);
+            }
+            ExitCode::SUCCESS
+        }
         Commands::Mcp => {
             let h = match Handler::new() {
                 Ok(h) => h,

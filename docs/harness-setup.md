@@ -72,3 +72,57 @@ Notes:
   refuses an existing destination by design. Either keep harness-made trees
   foreign, or let the agent use `create_worktree` instead of the harness
   feature and hand the returned path back to the harness.
+
+## Idle-worktree notification hook
+
+`agent-worktree hook context [--host claude|codex]` is a `UserPromptSubmit`
+hook: once a linked worktree has had no activity for over 24 h, it injects
+one bounded `<agent-worktree>` block into the orchestrator's context — once
+per idle episode, rate-limited to one scan per 10 minutes, always exit 0.
+Behaviour, state file and the episode rule:
+[notifications.md](notifications.md). Documented, not tested against
+specific harness builds — verify in a disposable session first.
+
+Claude Code (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/agent-worktree hook context --host claude"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Codex and Claude Code through crew (`[[hooks]]` entry modelled on the
+existing `agent-run-context` entry, which uses the same `UserPromptSubmit`
+envelope for both runtimes):
+
+```toml
+[[hooks]]
+name = "agent-worktree-idle"
+runtimes = ["codex", "claude"]
+command = ["/absolute/path/to/agent-worktree", "hook", "context"]
+timeout = 10
+
+[hooks.codex]
+event = "UserPromptSubmit"
+matcher = ".*"
+status_message = "Reading idle-worktree context"
+
+[hooks.claude]
+event = "UserPromptSubmit"
+matcher = ""
+command = ["/absolute/path/to/agent-worktree", "hook", "context", "--host", "claude"]
+```
+
+The product home follows `AGENT_WORKTREE_HOME` (default `~/.agent-worktree`),
+so an orchestrator-side install scans the same scope `list_worktrees` sees.

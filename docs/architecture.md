@@ -142,6 +142,16 @@ never lost). Deletion is permanent; quarantine/trash was rejected because copies
 with build caches can weigh tens of GiB. If Git itself refuses (for example a
 dirty tree), the outcome is reported, never forced through.
 
+## Notifications
+
+`hook context` is a `UserPromptSubmit` host hook, not a tool. It scans the
+same scope as a repo-less `list_worktrees` with the same cheap page signals,
+and when a linked worktree crosses the idle threshold it injects one bounded
+`<agent-worktree>` block — once per (canonical path, last-activity) episode,
+recorded in `<home>/state/v1/notify.json`, rate-limited to one scan per
+10 minutes, always exit 0 within a 3 s deadline. It never mutates
+repositories. Details: docs/notifications.md.
+
 ## Pruning
 
 `prune_worktrees` is repository-wide with `{repo, dry_run}`. Dry run lists

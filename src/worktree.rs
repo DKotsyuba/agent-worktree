@@ -809,7 +809,13 @@ pub fn assess_removal(
 
 /// Newest of the cheap activity timestamps; `None` when every signal is absent.
 fn newest_signal(observation: &Observation) -> Option<u64> {
-    let signals = &observation.activity_signals;
+    newest_activity_signal(&observation.activity_signals)
+}
+
+/// Newest of one worktree's cheap activity timestamps (HEAD/index mtime, last
+/// reflog entry); `None` when every signal is absent.
+#[must_use]
+pub fn newest_activity_signal(signals: &ActivitySignals) -> Option<u64> {
     [
         signals.head_mtime,
         signals.index_mtime,

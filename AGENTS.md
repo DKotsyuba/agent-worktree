@@ -24,6 +24,7 @@ the diff.
 | `src/git.rs` | Git subprocess access: inventory, observation, create, remove, prune, live processes, size |
 | `src/store.rs` | layout/config resolution, per-repo lock, revision-checked record writes, known-repo registry, discovery |
 | `src/service.rs` | orchestration: budgets, policy, locking, store + git composition |
+| `src/notify.rs` | idle-worktree notification hook: episode state, rate limit, block rendering |
 | `src/tools/*`, `src/response.rs`, `src/main.rs` | MCP tool surface, rendering, wiring |
 
 ## Safety invariants

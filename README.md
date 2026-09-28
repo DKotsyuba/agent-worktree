@@ -67,7 +67,9 @@ args = ["mcp"]
 ```
 
 To share the worktree root with a harness's own worktree feature, see
-[docs/harness-setup.md](docs/harness-setup.md).
+[docs/harness-setup.md](docs/harness-setup.md); to get one context
+notification per 24 h-idle worktree, see
+[docs/notifications.md](docs/notifications.md).
 
 ## Configuration
 

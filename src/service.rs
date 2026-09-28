@@ -406,7 +406,14 @@ impl Service {
             let scope = self.repo_scope(&layout, repo).await?;
             registry_count = usize::from(scope.registered);
             scopes.push(scope);
+        } else if discovery {
+            let all = self.all_repo_scopes(&layout).await?;
+            registry_count = all.registry;
+            discovered_count = all.discovered;
+            budget_exhausted = all.discovery_exhausted;
+            scopes = all.scopes;
         } else {
+            // Discovery refused: the registry alone still resolves the scope.
             let registry = store::read_registry(&layout.home).map_err(store_error)?;
             for entry in &registry {
                 if scopes
@@ -424,28 +431,6 @@ impl Service {
                         .then_some(entry.integration_ref.clone()),
                     registered: true,
                 });
-            }
-            if discovery {
-                let report =
-                    store::discover(&layout, &budget(DISCOVERY_SECS)).map_err(store_error)?;
-                budget_exhausted = report.budget_exhausted;
-                for found in &report.repos {
-                    if scopes.iter().any(|s| s.common_dir == found.common_dir) {
-                        continue;
-                    }
-                    discovered_count += 1;
-                    let repo_id = RepoId::from_common_dir(&found.common_dir);
-                    let (entry, registered) =
-                        known_repo_entry(&layout, &repo_id, &found.common_dir)?;
-                    scopes.push(RepoScope {
-                        repo_id,
-                        common_dir: found.common_dir.clone(),
-                        label: entry.label,
-                        integration_ref: (!entry.integration_ref.is_empty())
-                            .then_some(entry.integration_ref),
-                        registered,
-                    });
-                }
             }
         }
 
@@ -678,6 +663,142 @@ impl Service {
                 }
             }
         }
+    }
+
+    /// Resolves the scope covering every known repository: the known-repo
+    /// registry plus configured discovery roots, deduplicated by common
+    /// directory. Shared by `list_worktrees` and the notification scan.
+    async fn all_repo_scopes(&self, layout: &Layout) -> Result<AllScopes, ServiceError> {
+        let mut scopes = Vec::new();
+        let registry = store::read_registry(&layout.home).map_err(store_error)?;
+        let mut registry_count = 0usize;
+        for entry in &registry {
+            if scopes
+                .iter()
+                .any(|s: &RepoScope| s.common_dir == entry.common_dir)
+            {
+                continue;
+            }
+            registry_count += 1;
+            scopes.push(RepoScope {
+                repo_id: RepoId::from_common_dir(&entry.common_dir),
+                common_dir: entry.common_dir.clone(),
+                label: entry.label.clone(),
+                integration_ref: (!entry.integration_ref.is_empty())
+                    .then_some(entry.integration_ref.clone()),
+                registered: true,
+            });
+        }
+        let mut discovered_count = 0usize;
+        let report = store::discover(layout, &budget(DISCOVERY_SECS)).map_err(store_error)?;
+        for found in &report.repos {
+            if scopes.iter().any(|s| s.common_dir == found.common_dir) {
+                continue;
+            }
+            discovered_count += 1;
+            let repo_id = RepoId::from_common_dir(&found.common_dir);
+            let (entry, registered) = known_repo_entry(layout, &repo_id, &found.common_dir)?;
+            scopes.push(RepoScope {
+                repo_id,
+                common_dir: found.common_dir.clone(),
+                label: entry.label,
+                integration_ref: (!entry.integration_ref.is_empty())
+                    .then_some(entry.integration_ref),
+                registered,
+            });
+        }
+        Ok(AllScopes {
+            scopes,
+            registry: registry_count,
+            discovered: discovered_count,
+            discovery_exhausted: report.budget_exhausted,
+        })
+    }
+
+    /// Collects the idle linked worktrees across the full list scope, for the
+    /// notification hook.
+    ///
+    /// The scan mirrors `list_worktrees` in scope (registry plus discovery
+    /// roots) and stays as cheap as its pages: one inventory per repository,
+    /// then one `git::observe` pass per existing non-main worktree with only
+    /// the integration probe — activity comes from the HEAD/index mtimes and
+    /// the last reflog entry, never a status walk, lsof or size measurement.
+    /// A worktree is idle when its newest signal is at least
+    /// `Policy::idle_after_secs` old; repositories, worktrees and probes that
+    /// fail are skipped, because the hook must never fail the host. `None`
+    /// means the pass is incomplete — scope resolution failed or `deadline`
+    /// ran out — and the caller must treat that as "no answer", never as an
+    /// empty result, so a truncated scan can neither notify nor rewrite the
+    /// episode state.
+    pub async fn idle_worktrees(&self, deadline: Instant) -> Option<Vec<IdleRow>> {
+        let mut rows = Vec::new();
+        let layout = self.layout().ok()?;
+        let all = self.all_repo_scopes(&layout).await.ok()?;
+        let now = unix_now();
+        for scope in all.scopes {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let remaining = Budget {
+                deadline,
+                max_output_bytes: MAX_OUTPUT_BYTES,
+                max_entries: MAX_ENTRIES,
+            };
+            let Ok(inventory) = git::inventory(&scope.common_dir, &remaining).await else {
+                continue;
+            };
+            let integration_ref = scope
+                .integration_ref
+                .clone()
+                .or_else(|| derived_integration(&inventory));
+            for registration in &inventory {
+                if !notifiable(registration) || !registration.path.try_exists().unwrap_or(false) {
+                    continue;
+                }
+                let Ok(observation) = git::observe(
+                    &scope.common_dir,
+                    &observe_spec(
+                        &registration.path,
+                        integration_ref.as_deref(),
+                        Checks {
+                            status: false,
+                            integration: true,
+                            processes: false,
+                            submodules: false,
+                            size: false,
+                        },
+                    ),
+                    &remaining,
+                )
+                .await
+                else {
+                    continue;
+                };
+                // Missing signals are never proof of abandonment: unknown
+                // activity means no notification.
+                let Some(last_activity) =
+                    worktree::newest_activity_signal(&observation.activity_signals)
+                else {
+                    continue;
+                };
+                if now.saturating_sub(last_activity) < self.policy.idle_after_secs {
+                    continue;
+                }
+                rows.push(IdleRow {
+                    label: scope.label.clone(),
+                    name: base_name(&registration.path),
+                    path: registration.path.clone(),
+                    idle_days: now.saturating_sub(last_activity) / 86_400,
+                    last_activity,
+                    merged: match observation.integration {
+                        crate::worktree::Probe::Known(Integration::AncestorMerged) => "merged",
+                        crate::worktree::Probe::Known(Integration::Unmerged) => "unmerged",
+                        _ => "unknown",
+                    },
+                });
+            }
+        }
+        Some(rows)
     }
 
     /// Hygiene counts over exactly the rows this page collected.
@@ -1188,6 +1309,43 @@ fn replay_target(layout: &Layout, scope: &RepoScope, args: &RemoveArgs) -> (Stri
         (_, Some(path)) => (base_name(Path::new(path)), canonicalize_gone(path)),
         _ => (String::new(), PathBuf::new()),
     }
+}
+
+/// Scope resolution over every known repository: registry plus discovery.
+struct AllScopes {
+    /// Repository scopes, deduplicated by common directory.
+    scopes: Vec<RepoScope>,
+    /// Scopes that came from the known-repo registry.
+    registry: usize,
+    /// Scopes found only by scanning configured discovery roots.
+    discovered: usize,
+    /// Whether the discovery budget ran out before covering every root.
+    discovery_exhausted: bool,
+}
+
+/// Whether one registration is a notification candidate at all: linked (not
+/// bare, not the main checkout) and not already prunable. Existence on disk is
+/// checked separately by the caller.
+fn notifiable(registration: &crate::worktree::Registration) -> bool {
+    !registration.is_main && !registration.bare && registration.prunable.is_none()
+}
+
+/// One idle linked worktree found by a notification scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdleRow {
+    /// Repository label used in per-repository directory names.
+    pub label: String,
+    /// Worktree directory base name.
+    pub name: String,
+    /// Absolute worktree path.
+    pub path: PathBuf,
+    /// Whole days since the last activity signal.
+    pub idle_days: u64,
+    /// Unix seconds of the newest cheap activity signal.
+    pub last_activity: u64,
+    /// Mergedness against the integration ref: `merged`, `unmerged` or
+    /// `unknown`.
+    pub merged: &'static str,
 }
 
 /// Canonicalizes a caller path for comparison with a record's bound path.
@@ -2344,5 +2502,26 @@ mod tests {
         assert!(validate_disposable(&["/abs".to_owned()]).is_err());
         assert!(validate_disposable(&["../up".to_owned()]).is_err());
         assert!(validate_disposable(&["".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn notification_candidates_exclude_main_bare_and_prunable() {
+        let registration =
+            |is_main: bool, bare: bool, prunable: bool| crate::worktree::Registration {
+                path: PathBuf::from("/wt/x"),
+                head: None,
+                branch: None,
+                detached: false,
+                bare,
+                locked: None,
+                prunable: prunable.then(|| "gone".to_owned()),
+                is_main,
+            };
+        assert!(notifiable(&registration(false, false, false)));
+        // The main checkout, bare roots and prunable registrations never
+        // notify: main is context, the others are not living worktrees.
+        assert!(!notifiable(&registration(true, false, false)));
+        assert!(!notifiable(&registration(false, true, false)));
+        assert!(!notifiable(&registration(false, false, true)));
     }
 }

@@ -533,7 +533,7 @@ pub fn delete_record(
 
 /// Writes `bytes` to `path` atomically: temp file in the same directory, fsync,
 /// rename, fsync of the directory. A failed attempt removes the temp file.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let dir = path.parent().ok_or_else(|| {
         StoreError::new(
             StoreErrorCode::Io,
