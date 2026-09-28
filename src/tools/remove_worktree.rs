@@ -94,11 +94,14 @@ fn preview_view(
         disposable: if disposable.is_empty() {
             "(none)".to_owned()
         } else {
-            disposable
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            response::bounded(
+                &disposable
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                512,
+            )
         },
         eligible,
         veto_count: decision.vetoes.len(),

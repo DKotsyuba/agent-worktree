@@ -26,7 +26,8 @@ applied prune still emits a Rust-side `COMMITTED` receipt.
 ## Refusals (`ERROR …`)
 
 - `invalid_arguments`, `repo_path_invalid`, `not_a_repository`.
-- `OUTCOME_UNKNOWN` naming the common directory when an applied prune loses
+- A dry-run failure is a read-style error; `OUTCOME_UNKNOWN` names the common
+  directory only when an applied prune loses
   confirmation; reconcile before retrying.
 - After an applied prune, records bound to pruned paths are deleted under the
   repository lock; failures surface as `record_cleanup_failed` warnings.

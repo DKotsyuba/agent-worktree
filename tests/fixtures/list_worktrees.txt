@@ -1,4 +1,5 @@
 OK worktrees: 1 returned; more=false
-0123456789ab/task-1 | managed | refs/heads/aw/task-1 | claude-code | 2.0 GiB (lower bound) | /tmp/w/demo--0123456789ab/task-1
-Hygiene: missing=0 orphan_candidates=0 removal_started=0
+0123456789ab/task-1 | managed | refs/heads/aw/task-1 | claude-code | stale~ | unmerged | 2.0 GiB (lower bound) | /tmp/w/demo--0123456789ab/task-1
+Hygiene (page): missing=0 idle=1 stale=1 unmerged=1 large=true
+Legend: activity bands marked ~ are mtime-based, not process-verified; stale is a subset of idle.
 Coverage: 1 repos (registry 1, discovered 0)

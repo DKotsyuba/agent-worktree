@@ -43,7 +43,9 @@ stored in the record and compared on replay.
 - `name_length` / `name_charset` / `branch_unsafe` / `creator_invalid` /
   `session_invalid` / `purpose_invalid` / `ttl_out_of_range` / `repo_path_invalid`.
 - `conflict` — destination exists without a matching record, a record exists
-  with a different metadata binding, or the path exists on disk. Nothing is
-  overwritten and no suffix is invented.
+  with a different metadata binding, the path exists on disk, or the existing
+  registration's path is gone (hint: prune first). Nothing is overwritten and
+  no suffix is invented.
+- `root_not_absolute` — the worktree root is not an absolute path.
 - `lock_timeout` — the per-repository lock was busy past the 30 s deadline.
 - `not_a_repository` — `repo` does not resolve to a Git repository.

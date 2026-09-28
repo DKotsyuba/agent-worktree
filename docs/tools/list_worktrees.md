@@ -2,12 +2,20 @@
 
 Effect: read. Response class: page (8 KiB cap, ≤ 20 rows). Idempotent: yes.
 
-Lists Git worktree registrations across the scope with ownership
-classification: `managed` (recorded by this product), `foreign` (registered
-with Git, no record), `missing` (registered path absent) and
-`orphan_candidate` (directory under the managed root without a registration —
-never automatically deletable). Inventory only: no status or size walks unless
-`size=true`, which measures only the rows shown on the page.
+Lists worktrees across the scope with ownership classification: `managed`
+(recorded by this product), `foreign` (registered with Git, no record),
+`missing` (registered path absent) and `orphan_candidate` (directory under the
+managed root without a registration — never automatically deletable).
+
+Every existing row on a page also carries cheap signals: an mtime-based
+activity band and mergedness. The activity band comes from the HEAD/index
+mtimes and the last reflog entry timestamp (never lsof, never a status walk)
+and is marked with `~` (`recent~`, `idle_candidate~`, `stale_candidate~`) so it
+is never mistaken for process-verified activity; mergedness is one bounded
+`merge-base --is-ancestor` per row against the derived integration ref. Rows
+whose pass did not finish under the page budget show `unknown`, never a guess;
+missing and orphan rows show `-`. `size=true` additionally measures the rows
+shown on the page.
 
 ## Arguments
 
@@ -34,15 +42,20 @@ invalidate, and the response never claims a stable total.
 
 `OK` (or `PARTIAL` when one repository's inventory failed — the reply stays a
 successful read and names the failure in `Coverage:`), one line per row
-(`key | class | branch | creator | size | path`; creator is `-` for foreign and
-missing rows), one
-hygiene line `missing=… orphan_candidates=… removal_started=…` computed only
-from data this call already collected, a `Coverage:` line, and `Cursor:` when
-more rows remain. A page that cannot fit a single row refuses with
-`response_too_large` instead of truncating an identifier; a page that would
-exceed the budget is shrunk, which is safe under keyset order.
+(`key | class | branch | creator | activity | integration | size | path`;
+creator is `-` for foreign and missing rows, size `-` unless requested), a
+hygiene line over exactly the rows this page collected
+(`missing=… idle=… stale=… unmerged=…` plus `orphan_candidates=`,
+`removal_started=` and `large=` when non-zero/requested; idle includes stale),
+a `Legend:` line, a `Coverage:` line, and `Cursor:` when more rows remain. The
+whole call shares one deadline; repositories not reached are named in
+`Coverage:` as `deadline_exceeded`, and a truncated orphan scan is flagged. A
+page that cannot fit a single row refuses with `response_too_large` instead of
+truncating an identifier; a page that would exceed the budget is shrunk, which
+is safe under keyset order.
 
 ## Refusals (`ERROR …`)
 
 - `invalid_arguments`, `limit_out_of_range`, `cursor_invalid`,
-  `cursor_scope_mismatch`, `repo_path_invalid`, `not_a_repository`.
+  `cursor_scope_mismatch`, `repo_path_invalid`, `not_a_repository`,
+  `root_not_absolute` (relative `AGENT_WORKTREE_ROOT` or `[storage] root`).

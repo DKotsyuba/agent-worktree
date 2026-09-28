@@ -204,7 +204,7 @@ async fn create_list_inspect_lifecycle() {
             .unwrap_or_else(|| panic!("task-1 row missing:\n{text}"));
         assert!(row.contains("managed"), "{row}");
         assert!(row.contains("claude-code"), "{row}");
-        assert!(text.contains("Hygiene: "), "{text}");
+        assert!(text.contains("Hygiene (page): "), "{text}");
         // The main worktree appears as foreign.
         assert!(text.contains("| foreign |"), "{text}");
 
@@ -489,6 +489,221 @@ async fn unmerged_and_foreign_removal_rules() {
 }
 
 #[tokio::test]
+async fn old_worktree_shows_as_stale_in_list_and_hygiene() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let repo = f.repo.display().to_string();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "old-task", "creator": "e2e",
+                "purpose": "ageing"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+
+        // Age the worktree far past the 30-day stale band: HEAD/index mtimes
+        // via touch, and the last reflog entry timestamp rewritten inside the
+        // admin dir's log (classify uses the entry timestamp, not file mtime).
+        let gitdir = f.repo.join(".git").join("worktrees").join("old-task");
+        assert!(gitdir.exists(), "admin dir missing: {}", gitdir.display());
+        const OLD_STAMP: &str = "2401010000"; // 2024-01-01 00:00, years ago
+        for file in ["HEAD", "index"] {
+            Command::new("touch")
+                .arg("-t")
+                .arg(OLD_STAMP)
+                .arg(gitdir.join(file))
+                .status()
+                .unwrap();
+        }
+        let forty_days_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 40 * 24 * 3600;
+        let reflog = gitdir.join("logs").join("HEAD");
+        std::fs::write(
+            &reflog,
+            format!(
+                "0000000000000000000000000000000000000000 \
+1111111111111111111111111111111111111111 e2e <e2e@test> {forty_days_ago} +0000\tageing\n"
+            )
+            .replace("\\n", "\n"),
+        )
+        .unwrap();
+        Command::new("touch")
+            .arg("-t")
+            .arg(OLD_STAMP)
+            .arg(&reflog)
+            .status()
+            .unwrap();
+
+        // The list itself shows the stale band and counts it in hygiene.
+        let (error, text) = call_text(
+            &f._client,
+            "list_worktrees",
+            serde_json::json!({"repo": repo}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        let row = text
+            .lines()
+            .find(|l| l.contains("/old-task |"))
+            .unwrap_or_else(|| panic!("old-task row missing:\n{text}"));
+        assert!(row.contains("stale_candidate~"), "{row}");
+        assert!(text.contains("idle=1 stale=1"), "{text}");
+        assert!(text.contains("Legend:"), "{text}");
+        // The freshly touched main worktree stays recent.
+        assert!(text.contains("recent~"), "{text}");
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
+async fn create_replay_refuses_when_registration_path_is_gone() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let repo = f.repo.display().to_string();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "task-1", "creator": "e2e",
+                "purpose": "gone"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        let path = field(&text, "Path").to_owned();
+
+        // The registration survives a raw directory deletion as prunable.
+        std::fs::remove_dir_all(&path).unwrap();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "task-1", "creator": "e2e",
+                "purpose": "gone"}),
+        )
+        .await;
+        assert!(error, "{text}");
+        assert!(text.starts_with("ERROR conflict:"), "{text}");
+        assert!(text.contains("prune_worktrees"), "{text}");
+
+        // Pruning clears the registration. The default branch is retained by
+        // design, so recovery re-creates by checking the existing branch out.
+        let (error, text) = call_text(
+            &f._client,
+            "prune_worktrees",
+            serde_json::json!({"repo": repo, "dry_run": false}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "task-1", "creator": "e2e",
+                "purpose": "gone", "branch": "aw/task-1"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert!(text.starts_with("COMMITTED worktree "), "{text}");
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
+async fn apply_replay_deletes_a_crashed_removals_record() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let repo = f.repo.display().to_string();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "crash-task", "creator": "e2e",
+                "purpose": "crash"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+
+        // Simulate a crashed removal: keep the record, graft a
+        // removal_started marker onto it after a clean apply removed tree,
+        // registration and record.
+        let records_dir = f.home.path().join("product/state/v1/repos");
+        let record_path = records_dir
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .flat_map(|entry| std::fs::read_dir(entry.path()).unwrap().flatten())
+            .find(|entry| entry.path().ends_with("crash-task.json"))
+            .map(|entry| entry.path())
+            .expect("record file exists");
+        let record = std::fs::read_to_string(&record_path).unwrap();
+        let (error, preview) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "crash-task", "mode": "preview"}),
+        )
+        .await;
+        assert!(!error, "{preview}");
+        let fingerprint = field(&preview, "Fingerprint");
+        let (error, receipt) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "crash-task", "mode": "apply",
+                "fingerprint": fingerprint}),
+        )
+        .await;
+        assert!(!error, "{receipt}");
+        assert!(
+            receipt.starts_with("COMMITTED remove_worktree "),
+            "{receipt}"
+        );
+        assert!(!record_path.exists(), "record deleted by apply");
+
+        // Resurrect the record as a crashed removal would have left it.
+        let crashed = record.replace(
+            "\"revision\":1",
+            &format!(
+                "\"removal_started\":{{\"fingerprint\":\"{fingerprint}\",\"at\":1}},\"revision\":1"
+            ),
+        );
+        std::fs::write(&record_path, crashed).unwrap();
+
+        // The replayed apply is a no-op that also clears the stale record.
+        let (error, receipt) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "crash-task", "mode": "apply",
+                "fingerprint": fingerprint}),
+        )
+        .await;
+        assert!(!error, "{receipt}");
+        assert!(receipt.starts_with("NOOP remove_worktree "), "{receipt}");
+        assert!(!record_path.exists(), "crashed record cleaned up");
+
+        // The name is free again; the retained branch is checked out as-is.
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "crash-task", "creator": "e2e",
+                "purpose": "recreated", "branch": "aw/crash-task"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert!(text.starts_with("COMMITTED worktree "), "{text}");
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
 async fn prune_preview_applies_and_pagination_visits_every_row_once() {
     let f = fixture().await;
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -537,7 +752,7 @@ async fn prune_preview_applies_and_pagination_visits_every_row_once() {
         .await;
         assert!(!error, "{text}");
         assert!(text.contains("| missing |"), "{text}");
-        assert!(text.contains("Hygiene: missing=1"), "{text}");
+        assert!(text.contains("Hygiene (page): missing=1"), "{text}");
         let (error, applied) = call_text(
             &f._client,
             "prune_worktrees",

@@ -160,12 +160,17 @@ a mutation was dispatched is `outcome_unknown`, never an automatic replay.
 
 ## Budgets
 
-Inventory lists registrations without status or size walks. Inspection bounds
-each expensive probe and the total pass; reports bound concurrency and total
-time; mutations (create, remove, prune) have a 30-second deadline including
-lock waits and verification. List pages are keyset-paginated with at most 20
-rows: the cursor is scope plus last key, with no stored snapshots; a restart
-invalidates cursors. Response budgets follow `docs/MCP_RESPONSE_STANDARD.md`.
+Inventory pages carry cheap per-row signals but never status walks or lsof:
+the activity band comes from HEAD/index mtimes and the last reflog entry
+timestamp (marked `~` in rows to distinguish it from process-verified
+activity), and mergedness is one bounded `merge-base` per row against the
+derived integration ref; rows whose pass misses the shared page budget report
+`unknown`. Size is measured only on request, for the page's rows. Inspection
+bounds each expensive probe and the total pass; mutations (create, remove,
+prune) have a 30-second deadline including lock waits and verification. List
+pages are keyset-paginated with at most 20 rows: the cursor is scope plus last
+key, with no stored snapshots. Response budgets follow
+`docs/MCP_RESPONSE_STANDARD.md`.
 
 ## Tools
 

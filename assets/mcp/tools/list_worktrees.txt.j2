@@ -1,8 +1,9 @@
 {{ status }} worktrees: {{ returned }} returned; more={{ has_more }}
 {% for row in rows %}
-{{ row.key }} | {{ row.class }} | {{ row.branch }} | {{ row.creator }} | {{ row.size }} | {{ row.path }}
+{{ row.key }} | {{ row.class }} | {{ row.branch }} | {{ row.creator }} | {{ row.activity }} | {{ row.integration }} | {{ row.size }} | {{ row.path }}
 {% endfor %}
-Hygiene: {{ hygiene }}
+Hygiene (page): {{ hygiene }}
+Legend: activity bands marked ~ are mtime-based, not process-verified; stale is a subset of idle.
 Coverage: {{ coverage }}
 {% if cursor %}
 Cursor: {{ cursor }}

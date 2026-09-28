@@ -10,7 +10,7 @@
 use crate::git::{self, Checks, CreateSpec, GitError, GitErrorCode, ObserveSpec};
 use crate::store::{self, KnownRepo, Layout, StoreError};
 use crate::worktree::{
-    self, Activity, Advice, Budget, Decision, Fingerprint, Observation, Policy,
+    self, Activity, Advice, Budget, Decision, Fingerprint, Integration, Observation, Policy,
     RECORD_SCHEMA_VERSION, Record, RemovalRequest, RepoId, WorktreeClass, WorktreeName,
 };
 use serde::Deserialize;
@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Mutation deadline in seconds, including lock waits and verification.
 const MUTATION_SECS: u64 = 30;
+/// Overall deadline for one list call, shared by every inventory in scope.
+const LIST_SECS: u64 = 30;
 /// Per-repository inventory deadline in seconds.
 const INVENTORY_SECS: u64 = 15;
 /// Single observation pass deadline in seconds.
@@ -197,7 +199,18 @@ impl Service {
         let platform_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
-        store::resolve_layout(env_home, env_root, platform_home).map_err(store_error)
+        let layout =
+            store::resolve_layout(env_home, env_root, platform_home).map_err(store_error)?;
+        // A relative root would make Git create worktrees inside the working
+        // directory or the repository's own administration tree.
+        if !layout.root.is_absolute() {
+            return Err(ServiceError::blocked(
+                "root_not_absolute",
+                "the worktree root must be an absolute path",
+            )
+            .with_next("set AGENT_WORKTREE_ROOT or [storage] root to an absolute path"));
+        }
+        Ok(layout)
     }
 
     /// Resolves the repository scope entry for one caller-supplied repo path.
@@ -206,13 +219,14 @@ impl Service {
             .await
             .map_err(git_read_error)?;
         let repo_id = RepoId::from_common_dir(&common_dir);
-        let entry = known_repo_entry(layout, &repo_id, &common_dir)?;
+        let (entry, registered) = known_repo_entry(layout, &repo_id, &common_dir)?;
         let integration_ref = (!entry.integration_ref.is_empty()).then_some(entry.integration_ref);
         Ok(RepoScope {
             common_dir,
             repo_id,
             label: entry.label,
             integration_ref,
+            registered,
         })
     }
 
@@ -239,12 +253,26 @@ impl Service {
         let inventory = git::inventory(&scope.common_dir, &op_budget)
             .await
             .map_err(git_read_error)?;
+        // Git records canonical paths (/private/… on macOS) while the root
+        // comes from the environment, so match the canonical destination, the
+        // literal one, and the record's bound path (captured at creation).
         let destination_key =
             std::fs::canonicalize(&destination).unwrap_or_else(|_| destination.clone());
-        if let Some(registration) = inventory
-            .iter()
-            .find(|r| r.path == destination_key || r.path == destination)
-        {
+        let record_path = record.as_ref().map(|record| record.path.clone());
+        if let Some(registration) = inventory.iter().find(|r| {
+            r.path == destination_key
+                || r.path == destination
+                || record_path.as_ref().is_some_and(|path| path == &r.path)
+        }) {
+            // A registration whose path is gone cannot satisfy a replay: the
+            // echoed path would not exist. Reconcile through prune instead.
+            if registration.prunable.is_some() || !registration.path.try_exists().unwrap_or(false) {
+                return Err(ServiceError::blocked(
+                    "conflict",
+                    "the existing registration's path is gone",
+                )
+                .with_next("run prune_worktrees, then retry the create"));
+            }
             if let Some(record) = &record {
                 if record.matches_request(args) {
                     return Ok(CreateOutcome::Noop {
@@ -350,6 +378,9 @@ impl Service {
 
     /// Lists worktrees across the requested scope with keyset pagination.
     pub async fn list_worktrees(&self, args: &ListArgs) -> Result<ListOutcome, ServiceError> {
+        if let Some(repo) = &args.repo {
+            validate_repo_path(repo)?;
+        }
         let limit = args.limit.unwrap_or(MAX_PAGE_ROWS);
         if limit == 0 || limit > MAX_PAGE_ROWS {
             return Err(ServiceError::blocked(
@@ -360,6 +391,8 @@ impl Service {
         // Structural cursor decoding precedes any state access so malformed
         // cursors refuse before a scan runs.
         let after = args.cursor.as_deref().map(parse_cursor).transpose()?;
+        // One deadline for the whole call; per-repository inventories share it.
+        let overall = budget(LIST_SECS);
         let layout = self.layout()?;
         let include_size = args.size.unwrap_or(false);
         let discovery = args.discovery.unwrap_or(true);
@@ -371,8 +404,9 @@ impl Service {
         let mut failed = Vec::new();
         let mut budget_exhausted = false;
         if let Some(repo) = &args.repo {
-            scopes.push(self.repo_scope(&layout, repo).await?);
-            registry_count = 1;
+            let scope = self.repo_scope(&layout, repo).await?;
+            registry_count = usize::from(scope.registered);
+            scopes.push(scope);
         } else {
             let registry = store::read_registry(&layout.home).map_err(store_error)?;
             for entry in &registry {
@@ -389,6 +423,7 @@ impl Service {
                     label: entry.label.clone(),
                     integration_ref: (!entry.integration_ref.is_empty())
                         .then_some(entry.integration_ref.clone()),
+                    registered: true,
                 });
             }
             if discovery {
@@ -401,13 +436,15 @@ impl Service {
                     }
                     discovered_count += 1;
                     let repo_id = RepoId::from_common_dir(&found.common_dir);
-                    let entry = known_repo_entry(&layout, &repo_id, &found.common_dir)?;
+                    let (entry, registered) =
+                        known_repo_entry(&layout, &repo_id, &found.common_dir)?;
                     scopes.push(RepoScope {
                         repo_id,
                         common_dir: found.common_dir.clone(),
                         label: entry.label,
                         integration_ref: (!entry.integration_ref.is_empty())
                             .then_some(entry.integration_ref),
+                        registered,
                     });
                 }
             }
@@ -419,29 +456,39 @@ impl Service {
         }
 
         // Inventory and classify every registration; orphan candidates are
-        // directories under our per-repo root without a registration.
+        // directories under our per-repo root without a registration. The
+        // per-repo facts (common dir, effective integration ref) are kept for
+        // the cheap page pass below.
         let mut rows: Vec<ListRow> = Vec::new();
-        let mut removal_started = 0usize;
-        for scope in &scopes {
-            let inventory = match git::inventory(&scope.common_dir, &budget(INVENTORY_SECS)).await {
+        let mut facts: Vec<(String, PathBuf, Option<String>)> = Vec::new();
+        let mut orphan_scan_truncated = false;
+        for (index, scope) in scopes.iter().enumerate() {
+            if Instant::now() >= overall.deadline {
+                // Scopes past the call deadline are named, not silently absent.
+                for scope in &scopes[index..] {
+                    failed.push((scope.repo_id.id12().to_owned(), "deadline_exceeded"));
+                }
+                budget_exhausted = true;
+                break;
+            }
+            let inventory = match git::inventory(&scope.common_dir, &overall).await {
                 Ok(inventory) => inventory,
                 Err(error) => {
                     failed.push((scope.repo_id.id12().to_owned(), error.code.as_str()));
                     continue;
                 }
             };
-            let mut registered_names = Vec::new();
+            let registered_paths: Vec<PathBuf> = inventory
+                .iter()
+                .map(|registration| registration.path.clone())
+                .collect();
             for registration in &inventory {
                 let name = base_name(&registration.path);
-                registered_names.push(name.clone());
                 let record = record_for(&layout.home, &scope.repo_id, &name)?;
-                if record
+                let removal_started = record
                     .as_ref()
                     .and_then(|r| r.removal_started.as_ref())
-                    .is_some()
-                {
-                    removal_started += 1;
-                }
+                    .is_some();
                 let class = if registration.prunable.is_some()
                     || !registration.path.try_exists().unwrap_or(false)
                 {
@@ -460,17 +507,35 @@ impl Service {
                     detached: registration.detached,
                     head: registration.head.clone(),
                     creator: record.as_ref().map(|r| r.creator.clone()),
+                    removal_started,
+                    activity: None,
+                    integration: None,
                     size: None,
                 });
             }
+            facts.push((
+                scope.repo_id.as_str().to_owned(),
+                scope.common_dir.clone(),
+                scope
+                    .integration_ref
+                    .clone()
+                    .or_else(|| derived_integration(&inventory)),
+            ));
             let repo_dir = layout
                 .root
                 .join(worktree::repo_directory(&scope.label, &scope.repo_id));
             if let Ok(entries) = std::fs::read_dir(&repo_dir) {
-                for entry in entries.take(MAX_ORPHAN_ENTRIES).flatten() {
+                for (scanned, entry) in entries.flatten().enumerate() {
+                    if scanned == MAX_ORPHAN_ENTRIES {
+                        orphan_scan_truncated = true;
+                        break;
+                    }
                     let path = entry.path();
                     let name = base_name(&path);
-                    if registered_names.contains(&name) {
+                    // Registration identity is the full path, not the base
+                    // name, which can repeat across foreign worktrees.
+                    let path_key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    if registered_paths.contains(&path_key) {
                         continue;
                     }
                     let is_dir = entry
@@ -489,6 +554,9 @@ impl Service {
                         detached: false,
                         head: None,
                         creator: None,
+                        removal_started: false,
+                        activity: None,
+                        integration: None,
                         size: None,
                     });
                 }
@@ -504,18 +572,7 @@ impl Service {
             }
             None => true,
         });
-        let hygiene = Hygiene {
-            missing: rows
-                .iter()
-                .filter(|r| r.class == WorktreeClass::Missing)
-                .count(),
-            orphan: rows
-                .iter()
-                .filter(|r| r.class == WorktreeClass::OrphanCandidate)
-                .count(),
-            removal_started,
-        };
-        let (page, has_more) = match fit_rows(rows, limit) {
+        let (mut page, has_more) = match fit_rows(rows, limit) {
             PageFit::Refused => {
                 return Err(ServiceError::blocked(
                     "response_too_large",
@@ -525,11 +582,8 @@ impl Service {
             }
             PageFit::Fit { rows, has_more } => (rows, has_more),
         };
-        let page = if include_size {
-            self.measure_page(page).await
-        } else {
-            page
-        };
+        self.annotate_page(&mut page, &facts, include_size).await;
+        let hygiene = self.page_hygiene(&page, include_size);
         let cursor = if has_more {
             page.last()
                 .map(|row| encode_cursor(&scope_digest, &row.repo_id, &row.path))
@@ -546,28 +600,104 @@ impl Service {
                 discovered: discovered_count,
                 failed,
                 budget_exhausted,
+                orphan_scan_truncated,
             },
             hygiene,
         })
     }
 
-    /// Measures size for the rows shown on this page only.
+    /// Adds cheap per-row signals to the rows shown on this page.
     ///
-    /// All rows share one observation budget, so a whole page of slow trees
-    /// cannot multiply into an unbounded call; rows past the deadline stay
-    /// unmeasured (rendered distinctly from "not requested").
-    async fn measure_page(&self, rows: Vec<ListRow>) -> Vec<ListRow> {
+    /// Each existing worktree gets one `git::observe` pass with only the
+    /// integration probe (plus optional size): activity comes from the cheap
+    /// HEAD/index/reflog timestamps — never lsof or a status walk — and one
+    /// bounded `merge-base` answers mergedness. All rows share one page
+    /// budget; rows whose pass did not finish show `unknown`, never a guess,
+    /// and missing/orphan rows are not probed at all.
+    async fn annotate_page(
+        &self,
+        page: &mut [ListRow],
+        facts: &[(String, PathBuf, Option<String>)],
+        include_size: bool,
+    ) {
         let shared = budget(OBSERVE_SECS);
-        let mut measured = Vec::with_capacity(rows.len());
-        for mut row in rows {
-            if row.class != WorktreeClass::Missing
-                && let Ok(size) = git::measure_size(&row.path, &shared).await
-            {
-                row.size = Some(size);
+        let now = unix_now();
+        let checks = Checks {
+            status: false,
+            integration: true,
+            processes: false,
+            submodules: false,
+            size: include_size,
+        };
+        for row in page.iter_mut() {
+            if row.class == WorktreeClass::Missing || row.class == WorktreeClass::OrphanCandidate {
+                continue;
             }
-            measured.push(row);
+            let Some((_, common_dir, integration_ref)) =
+                facts.iter().find(|(id, _, _)| *id == row.repo_id)
+            else {
+                continue;
+            };
+            let observed = git::observe(
+                common_dir,
+                &observe_spec(&row.path, integration_ref.as_deref(), checks),
+                &shared,
+            )
+            .await;
+            match observed {
+                Ok(observation) => {
+                    row.activity =
+                        Some(worktree::classify(&observation, &self.policy, now).activity);
+                    row.integration = match observation.integration {
+                        crate::worktree::Probe::Known(value) => Some(value),
+                        // A failed or degraded probe is unknown, never clean.
+                        _ => Some(Integration::Unknown),
+                    };
+                    if include_size && let crate::worktree::Probe::Known(size) = observation.size {
+                        row.size = Some(size);
+                    }
+                }
+                // The page budget ran out mid-pass: unknown, not a guess.
+                Err(_) => {
+                    row.activity = Some(Activity::Unknown);
+                    row.integration = Some(Integration::Unknown);
+                }
+            }
         }
-        measured
+    }
+
+    /// Hygiene counts over exactly the rows this page collected.
+    fn page_hygiene(&self, page: &[ListRow], include_size: bool) -> Hygiene {
+        Hygiene {
+            missing: page
+                .iter()
+                .filter(|r| r.class == WorktreeClass::Missing)
+                .count(),
+            orphan: page
+                .iter()
+                .filter(|r| r.class == WorktreeClass::OrphanCandidate)
+                .count(),
+            removal_started: page.iter().filter(|r| r.removal_started).count(),
+            // Stale rows are at least 7 days old too, so they count as idle.
+            idle: page
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.activity,
+                        Some(Activity::IdleCandidate | Activity::StaleCandidate)
+                    )
+                })
+                .count(),
+            stale: page
+                .iter()
+                .filter(|r| r.activity == Some(Activity::StaleCandidate))
+                .count(),
+            unmerged: page
+                .iter()
+                .filter(|r| r.integration == Some(Integration::Unmerged))
+                .count(),
+            large: include_size && page.iter().filter(|r| r.large(&self.policy)).count() > 0,
+        }
     }
 
     /// Inspects one worktree with bounded probes; partial when probes degrade.
@@ -575,6 +705,7 @@ impl Service {
         &self,
         args: &InspectArgs,
     ) -> Result<InspectOutcome, ServiceError> {
+        validate_repo_path(&args.repo)?;
         let layout = self.layout()?;
         let scope = self.repo_scope(&layout, &args.repo).await?;
         let resolved = self
@@ -620,6 +751,7 @@ impl Service {
 
     /// Previews or applies one worktree removal; never forces, never drops branches.
     pub async fn remove_worktree(&self, args: &RemoveArgs) -> Result<RemoveOutcome, ServiceError> {
+        validate_repo_path(&args.repo)?;
         let mode = RemoveMode::parse(args.mode.as_str())?;
         if args.name.is_some() == args.path.is_some() {
             return Err(ServiceError::blocked(
@@ -654,12 +786,38 @@ impl Service {
                         .unwrap_or(false) =>
             {
                 let (name, path) = replay_target(&layout, &scope, args);
+                let mut warnings = Vec::new();
+                // A crashed removal can leave a record with removal_started
+                // behind while tree and registration are gone; that record
+                // would block the name forever, so delete it under the lock.
+                if let Some(valid_name) = WorktreeName::parse(&name).ok()
+                    && let Ok(Some(record)) = record_for(&layout.home, &scope.repo_id, &name)
+                    && record.path == path
+                    && record.removal_started.is_some()
+                    && let Err(error) = (|| async {
+                        let guard =
+                            store::lock_repo(&layout.home, &scope.repo_id, &budget(MUTATION_SECS))
+                                .await
+                                .map_err(store_error)?;
+                        store::delete_record(
+                            &layout.home,
+                            &guard,
+                            &scope.repo_id,
+                            &valid_name,
+                            record.revision,
+                        )
+                        .map_err(store_error)
+                    })()
+                    .await
+                {
+                    warnings.push(format!("record_cleanup_pending: {}", error.code.as_str()));
+                }
                 return Ok(RemoveOutcome::Applied {
                     key: format!("{}/{}", scope.repo_id.id12(), name),
                     path,
                     branch: None,
                     outcome: RemoveOutcomeKind::AlreadyAbsent,
-                    warnings: Vec::new(),
+                    warnings,
                 });
             }
             Err(error) => return Err(error),
@@ -797,6 +955,7 @@ impl Service {
 
     /// Prunes stale registrations repository-wide; dry run by default.
     pub async fn prune_worktrees(&self, args: &PruneArgs) -> Result<PruneOutcome, ServiceError> {
+        validate_repo_path(&args.repo)?;
         let dry_run = args.dry_run.unwrap_or(true);
         let layout = self.layout()?;
         let scope = self.repo_scope(&layout, &args.repo).await?;
@@ -805,7 +964,12 @@ impl Service {
             .await
             .map_err(|e| {
                 let target = format!("prune_worktrees {}", scope.repo_id.id12());
-                git_mutation_error(e, &target, &scope.common_dir)
+                // A dry run dispatches no mutation, so it reports read-style.
+                if dry_run {
+                    git_read_error(e)
+                } else {
+                    git_mutation_error(e, &target, &scope.common_dir)
+                }
             })?;
         let mut warnings = Vec::new();
         if result.applied {
@@ -917,6 +1081,8 @@ struct RepoScope {
     /// Registry-recorded integration ref; `None` when absent or empty, in which
     /// case observers derive it from the main worktree's branch.
     integration_ref: Option<String>,
+    /// Whether the registry already knows this repository.
+    registered: bool,
 }
 
 /// A resolved removal or inspection target.
@@ -929,12 +1095,13 @@ struct Target {
 
 /// Best-effort (name, path) identity for an apply replay that found nothing.
 fn replay_target(layout: &Layout, scope: &RepoScope, args: &RemoveArgs) -> (String, PathBuf) {
+    // The root is canonicalized when present so the reconstructed path can be
+    // compared with the record's bound path regardless of /var vs /private.
+    let root = std::fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone());
     match (&args.name, &args.path) {
         (Some(name), None) => (
             name.clone(),
-            layout
-                .root
-                .join(worktree::repo_directory(&scope.label, &scope.repo_id))
+            root.join(worktree::repo_directory(&scope.label, &scope.repo_id))
                 .join(name),
         ),
         (_, Some(path)) => (base_name(Path::new(path)), PathBuf::from(path)),
@@ -994,21 +1161,24 @@ fn known_repo_entry(
     layout: &Layout,
     repo_id: &RepoId,
     common_dir: &Path,
-) -> Result<KnownRepo, ServiceError> {
+) -> Result<(KnownRepo, bool), ServiceError> {
     if let Ok(registry) = store::read_registry(&layout.home)
         && let Some(entry) = registry.iter().find(|e| e.repo_id == repo_id.as_str())
     {
-        return Ok(entry.clone());
+        return Ok((entry.clone(), true));
     }
     let label = derive_label(common_dir);
     // Empty means "not derivable yet"; creation fills it from the main branch.
-    Ok(KnownRepo {
-        repo_id: repo_id.as_str().to_owned(),
-        common_dir: common_dir.to_owned(),
-        label,
-        integration_ref: String::new(),
-        registered_at: unix_now(),
-    })
+    Ok((
+        KnownRepo {
+            repo_id: repo_id.as_str().to_owned(),
+            common_dir: common_dir.to_owned(),
+            label,
+            integration_ref: String::new(),
+            registered_at: unix_now(),
+        },
+        false,
+    ))
 }
 
 /// Reads the record for a display name; `None` when the name cannot address a
@@ -1130,14 +1300,22 @@ fn fit_rows(rows: Vec<ListRow>, limit: usize) -> PageFit {
 
 /// Upper bound of one rendered list row line in bytes.
 fn row_line_bytes(row: &ListRow) -> usize {
+    // Worst-case cells: activity `stale_candidate~` (16), integration
+    // `unmerged` (8), size `999.9 TiB (lower bound)` (26), creator ≤ 64.
     row.key.len()
         + row.class_label().len()
         + row.branch.as_deref().map_or(7, str::len)
-        + row.size.as_ref().map_or(1, |_| 32)
-        + row.path.display().to_string().len()
+        + row.creator.as_ref().map_or(1, |c| c.len())
         + 16
+        + 8
+        + row.size.as_ref().map_or(1, |_| 26)
+        + row.path.display().to_string().len()
+        // Seven " | " separators plus the newline.
+        + 21
+        + 1
 }
 fn encode_cursor(scope_digest: &[u8; 32], repo_id: &str, path: &Path) -> String {
+    // The path travels as raw OS bytes so non-UTF-8 worktree names round-trip.
     let mut bytes = Vec::with_capacity(64 + 8 + path.as_os_str().len());
     bytes.extend_from_slice(b"awlist1");
     bytes.extend_from_slice(scope_digest);
@@ -1173,6 +1351,13 @@ fn parse_cursor(encoded: &str) -> Result<CursorKey, ServiceError> {
     if RepoId::parse(repo_id).is_err() {
         return Err(invalid());
     }
+    // Paths are raw OS bytes, not guaranteed UTF-8; decode them losslessly.
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(&rest[split + 1..]))
+    };
+    #[cfg(not(unix))]
     let path = PathBuf::from(std::str::from_utf8(&rest[split + 1..]).map_err(|_| invalid())?);
     if path.as_os_str().is_empty() {
         return Err(invalid());
@@ -1567,6 +1752,13 @@ pub struct ListRow {
     pub head: Option<String>,
     /// Record creator when a record backs the row.
     pub creator: Option<String>,
+    /// Whether the record's removal was dispatched but never completed.
+    pub removal_started: bool,
+    /// Mtime-based activity band when the cheap page pass ran; `None` when the
+    /// row was not probed (missing or orphan rows).
+    pub activity: Option<Activity>,
+    /// Mergedness from the cheap page pass; `None` when not probed.
+    pub integration: Option<Integration>,
     /// On-disk size when requested and measurable.
     pub size: Option<worktree::Size>,
 }
@@ -1588,17 +1780,36 @@ impl ListRow {
             .as_deref()
             .unwrap_or(if self.detached { "detached" } else { "unknown" })
     }
+
+    /// Whether a measured size reaches the policy's large threshold.
+    #[must_use]
+    pub fn large(&self, policy: &Policy) -> bool {
+        self.size
+            .as_ref()
+            .is_some_and(|size| size.bytes >= policy.size_warning_bytes)
+    }
 }
 
-/// Hygiene counts derived from data already collected in the call.
+/// Hygiene counts over exactly the rows one page collected.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Hygiene {
-    /// Registrations whose path is absent.
+    /// Page rows whose registered path is absent.
     pub missing: usize,
-    /// Directories under the managed root without a registration.
+    /// Page rows that are directories without a registration.
     pub orphan: usize,
-    /// Records whose removal was dispatched but never completed.
+    /// Page rows whose removal was dispatched but never completed.
     pub removal_started: usize,
+    /// Page rows idle for at least `Policy::idle_after_secs` (mtime-based);
+    /// includes stale rows.
+    pub idle: usize,
+    /// Page rows stale for at least `Policy::stale_after_secs` (a subset of
+    /// `idle`).
+    pub stale: usize,
+    /// Page rows whose HEAD is not merged into the integration ref.
+    pub unmerged: usize,
+    /// Whether any measured page row reached the policy's large threshold;
+    /// only meaningful when size was requested.
+    pub large: bool,
 }
 
 /// Scope coverage of one list call.
@@ -1612,8 +1823,10 @@ pub struct Coverage {
     pub discovered: usize,
     /// Repositories whose inventory failed, with stable codes.
     pub failed: Vec<(String, &'static str)>,
-    /// Whether the discovery budget ran out before covering the scope.
+    /// Whether the discovery or call budget ran out before covering the scope.
     pub budget_exhausted: bool,
+    /// Whether the per-repo orphan scan hit its entry cap without finishing.
+    pub orphan_scan_truncated: bool,
 }
 
 /// Result of a successful list call.
@@ -1741,6 +1954,7 @@ mod tests {
                 common_dir: PathBuf::from("/x"),
                 label: "repo".to_owned(),
                 integration_ref: Some("main".to_owned()),
+                registered: true,
             })
             .collect();
         list_scope_digest(&None, true, false, &scopes)
@@ -1769,6 +1983,17 @@ mod tests {
         let err = check_cursor_scope(&decoded, &other).unwrap_err();
         assert_eq!(err.code, "cursor_scope_mismatch");
         assert!(err.next.is_some());
+    }
+
+    #[test]
+    fn cursor_round_trips_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let id = sample_id();
+        let digest = scope_digest_for(&[&id]);
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/w/caf\xe9"));
+        let cursor = encode_cursor(&digest, &id, &odd);
+        let decoded = parse_cursor(&cursor).unwrap();
+        assert_eq!(decoded.path.as_os_str().as_bytes(), b"/w/caf\xe9");
     }
 
     #[test]
@@ -1804,6 +2029,9 @@ mod tests {
                 detached: false,
                 head: None,
                 creator: None,
+                removal_started: false,
+                activity: None,
+                integration: None,
                 size: None,
             }
         }

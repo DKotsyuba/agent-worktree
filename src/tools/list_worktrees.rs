@@ -5,6 +5,7 @@
 //! call already collected; no extra scan is performed.
 use crate::response::{self, Class, Templates};
 use crate::service::{self, Coverage, Hygiene, ListOutcome, ListRow, Service};
+use crate::worktree::{Activity, Integration};
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -34,6 +35,8 @@ struct RowView {
     class: &'static str,
     branch: String,
     creator: String,
+    activity: String,
+    integration: String,
     size: String,
     path: String,
 }
@@ -69,22 +72,55 @@ fn coverage_label(coverage: &Coverage) -> String {
         text.push_str(&format!("; failed: {}", response::bounded(&failed, 160)));
     }
     if coverage.budget_exhausted {
-        text.push_str("; discovery budget exhausted before covering the scope");
+        text.push_str("; discovery or call budget exhausted before covering the scope");
+    }
+    if coverage.orphan_scan_truncated {
+        text.push_str("; orphan scan hit its entry cap");
     }
     text
 }
 
-/// Hygiene line from data already collected in this call.
-fn hygiene_label(hygiene: &Hygiene) -> String {
-    format!(
-        "missing={} orphan_candidates={} removal_started={}",
-        hygiene.missing, hygiene.orphan, hygiene.removal_started
-    )
+/// Mtime-based activity cell: band plus `~`, or `unknown` when the page pass
+/// did not finish, or `-` when the row was not probed.
+fn activity_cell(row: &ListRow) -> String {
+    match row.activity {
+        Some(Activity::Unknown) => "unknown".to_owned(),
+        Some(band) => format!("{}~", crate::service::activity_label(band)),
+        None => "-".to_owned(),
+    }
+}
+
+/// Mergedness cell: `merged`/`unmerged`/`unknown`, or `-` when not probed.
+fn integration_cell(row: &ListRow) -> String {
+    match row.integration {
+        Some(Integration::AncestorMerged) => "merged".to_owned(),
+        Some(Integration::Unmerged) => "unmerged".to_owned(),
+        Some(Integration::Unknown) => "unknown".to_owned(),
+        None => "-".to_owned(),
+    }
+}
+
+/// Hygiene line from the rows this page collected.
+fn hygiene_label(hygiene: &Hygiene, include_size: bool) -> String {
+    let mut text = format!(
+        "missing={} idle={} stale={} unmerged={}",
+        hygiene.missing, hygiene.idle, hygiene.stale, hygiene.unmerged
+    );
+    if hygiene.orphan > 0 {
+        text.push_str(&format!(" orphan_candidates={}", hygiene.orphan));
+    }
+    if hygiene.removal_started > 0 {
+        text.push_str(&format!(" removal_started={}", hygiene.removal_started));
+    }
+    if include_size {
+        text.push_str(&format!(" large={}", hygiene.large));
+    }
+    text
 }
 
 pub fn definition() -> Value {
     json!({"name":"list_worktrees",
-        "description":"List Git worktree registrations across the managed scope with ownership classification (managed, foreign, missing, orphan_candidate). Read-only. Keyset-paginated, at most 20 rows per page; orphan candidates are never automatically deletable.",
+        "description":"List worktrees across the managed scope with ownership classification (managed, foreign, missing, orphan_candidate) and cheap per-row signals: mtime-based activity band (recent~/idle~/stale~) and mergedness. Read-only. Keyset-paginated, at most 20 rows per page; orphan candidates are never automatically deletable.",
         "inputSchema":{"type":"object",
             "properties":{
                 "repo":{"type":"string","description":"Restrict the scope to one repository; omit for all known repositories."},
@@ -128,11 +164,13 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
                 class: row.class_label(),
                 branch: row.branch_label().to_owned(),
                 creator: row.creator.clone().unwrap_or_else(|| "-".to_owned()),
+                activity: activity_cell(row),
+                integration: integration_cell(row),
                 size: size_label(row, include_size),
                 path: row.path.display().to_string(),
             })
             .collect(),
-        hygiene: hygiene_label(&hygiene),
+        hygiene: hygiene_label(&hygiene, include_size),
         coverage: coverage_label(&coverage),
         cursor,
     };
@@ -170,6 +208,9 @@ mod tests {
             detached: false,
             head: None,
             creator: Some("claude-code".to_owned()),
+            removal_started: false,
+            activity: Some(crate::worktree::Activity::StaleCandidate),
+            integration: Some(crate::worktree::Integration::Unmerged),
             size: Some(Size {
                 bytes: 2_u64 << 30,
                 quality: crate::worktree::SizeQuality::LowerBound,
@@ -188,10 +229,12 @@ mod tests {
                 class: "managed",
                 branch: "refs/heads/aw/task-1".to_owned(),
                 creator: "claude-code".to_owned(),
+                activity: "stale~".to_owned(),
+                integration: "unmerged".to_owned(),
                 size: "2.0 GiB (lower bound)".to_owned(),
                 path: "/tmp/w/demo--0123456789ab/task-1".to_owned(),
             }],
-            hygiene: "missing=0 orphan_candidates=0 removal_started=0".to_owned(),
+            hygiene: "missing=0 idle=1 stale=1 unmerged=1 large=true".to_owned(),
             coverage: "1 repos (registry 1, discovered 0)".to_owned(),
             cursor: None,
         };
@@ -218,6 +261,7 @@ mod tests {
             discovered: 1,
             failed: vec![("deadbeefcafe".to_owned(), "timeout")],
             budget_exhausted: true,
+            orphan_scan_truncated: false,
         };
         let label = coverage_label(&coverage);
         assert!(label.contains("deadbeefcafe(timeout)"));

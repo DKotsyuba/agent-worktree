@@ -88,7 +88,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List Git worktree registrations across the managed scope with ownership classification (managed, foreign, missing, orphan_candidate). Read-only. Keyset-paginated, at most 20 rows per page; orphan candidates are never automatically deletable.",
+    "description": "List worktrees across the managed scope with ownership classification (managed, foreign, missing, orphan_candidate) and cheap per-row signals: mtime-based activity band (recent~/idle~/stale~) and mergedness. Read-only. Keyset-paginated, at most 20 rows per page; orphan candidates are never automatically deletable.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
