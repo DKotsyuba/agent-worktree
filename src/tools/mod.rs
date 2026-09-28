@@ -18,7 +18,7 @@ mod tool_remove_worktree;
 
 pub fn definitions() -> Vec<Value> {
     vec![
-        json!({"name":"get_status", "description":"Report the product identity and scaffold qualification status. Read-only; does not access files or external services.",
+        json!({"name":"get_status", "description":"Report the product identity and release qualification status. Read-only; does not access files or external services.",
         "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
         tool_create_worktree::definition(),

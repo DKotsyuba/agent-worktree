@@ -19,7 +19,10 @@ use rmcp::{
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 #[derive(Parser)]
-#[command(version, about = "Rust agent MCP")]
+#[command(
+    version,
+    about = "MCP server that keeps Git worktrees tidy for an orchestrating agent"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -94,7 +97,7 @@ impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .with_instructions("Use get_status for identity. Tool descriptions define effects. A not_implemented result never means work was performed.")
+            .with_instructions("Tools: get_status, create_worktree, list_worktrees, inspect_worktree, remove_worktree, prune_worktrees; tool descriptions define effects. Removal is always preview → fingerprint → apply and refuses anything not provably clean. Git is never forced and branches are never deleted.")
     }
     async fn list_tools(
         &self,

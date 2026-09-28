@@ -6,7 +6,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Report the product identity and scaffold qualification status. Read-only; does not access files or external services.",
+    "description": "Report the product identity and release qualification status. Read-only; does not access files or external services.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

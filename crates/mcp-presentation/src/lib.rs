@@ -182,7 +182,7 @@ impl Renderer {
         self.read_reply("status", &view)
     }
 
-    /// Safe, fixed error for the starter's parameterless identity tool.
+    /// Safe, fixed error for the parameterless identity tool.
     #[must_use]
     pub fn invalid_arguments(&self) -> TextReply {
         self.error_reply(
