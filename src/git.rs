@@ -2,15 +2,17 @@
 //!
 //! Every function runs Git as a subprocess with an explicit deadline, output cap
 //! and NUL-separated parsing. Git is never fetched from, never passed `--force`,
-//! and hooks/fsmonitor/prompting are suppressed per call. Probes that cannot run
-//! report `Unavailable` or `Incomplete`, never a clean-looking fake value.
+//! and hooks/fsmonitor/prompting are suppressed per call, while inherited
+//! repository-selecting `GIT_*` environment variables are stripped so a call can
+//! never be re-bound to the wrong repository. Probes that cannot run report
+//! `Unavailable` or `Incomplete`, never a clean-looking fake value.
 
 use crate::worktree::{
     ActivitySignals, Budget, Integration, Observation, Probe, Registration, RepoId, Size,
     SizeQuality, StatusFacts, SubmoduleFacts, WorktreeId, WorktreeName,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -190,7 +192,7 @@ pub async fn observe(
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_default();
     let gitdir = worktree_gitdir(common_dir, &registration, budget).await;
-    let activity_signals = activity_signals(&gitdir);
+    let activity_signals = activity_signals(gitdir.as_deref());
 
     let mut status_probe = Probe::NotChecked;
     let mut submodules_probe = Probe::NotChecked;
@@ -313,7 +315,9 @@ pub struct Created {
 ///
 /// Never overwrites an existing directory or branch: an existing destination,
 /// an existing target branch or a branch already checked out elsewhere is a
-/// `Conflict`. Creation is a mutation, so a timeout after dispatch reports
+/// `Conflict`, and combining `base` with an existing `branch` is refused too
+/// (Git checks a branch out as-is; a base would be silently ignored).
+/// Creation is a mutation, so a timeout after dispatch reports
 /// `OutcomeUnknown` instead of implying nothing happened.
 pub async fn create(
     common_dir: &Path,
@@ -325,6 +329,12 @@ pub async fn create(
     }
     if let Some(branch) = spec.branch {
         ensure_ref_arg(branch)?;
+    }
+    if !spec.detached && matches!((spec.base, spec.branch), (Some(_), Some(_))) {
+        return Err(GitError::new(
+            GitErrorCode::Conflict,
+            "base cannot be combined with checking out an existing branch",
+        ));
     }
     if std::fs::symlink_metadata(spec.destination).is_ok() {
         return Err(GitError::new(
@@ -399,6 +409,10 @@ pub enum RemoveOutcome {
 /// checked by the caller under the repository lock before this is dispatched;
 /// a Git refusal is reported as `Conflict` with Git's own message, and a path
 /// that is already gone and unregistered is `AlreadyAbsent`.
+///
+/// Callers MUST veto ignored files outside the approved disposable paths
+/// before dispatch: Git itself happily removes a worktree whose only content
+/// is ignored files, so this function cannot be the guard for them.
 pub async fn remove(
     common_dir: &Path,
     worktree_path: &Path,
@@ -442,6 +456,9 @@ pub async fn prune(
     budget: &Budget,
 ) -> Result<PruneResult, GitError> {
     let registrations = inventory(common_dir, budget).await?;
+    // Capture the admin-name → worktree-path mapping before pruning deletes
+    // the admin entries it removes.
+    let admins = admin_map(common_dir);
     let mut args = s(&["worktree", "prune"]);
     if dry_run {
         args.push("--dry-run".into());
@@ -457,8 +474,9 @@ pub async fn prune(
         .lines()
         .filter_map(|line| {
             let rest = line.strip_prefix("Removing worktrees/")?;
-            let name = rest.split(':').next()?;
-            Some(resolve_worktree_path(common_dir, &registrations, name))
+            // Split at the last separator; prune reasons may contain colons.
+            let name = rest.rsplit_once(": ")?.0;
+            resolve_worktree_path(&admins, &registrations, name)
         })
         .collect();
     Ok(PruneResult {
@@ -532,8 +550,13 @@ pub async fn live_processes_under(
 /// allocated bytes without double-counting hard links. Budget exhaustion yields
 /// `Size::quality == LowerBound`, never a fabricated complete total.
 pub async fn measure_size(path: &Path, budget: &Budget) -> Result<Size, GitError> {
-    // ponytail: synchronous walk; a huge tree can stall the runtime thread —
-    // move to spawn_blocking if measured trees grow past millions of entries.
+    if Instant::now() >= budget.deadline {
+        return Err(GitError::new(
+            GitErrorCode::Timeout,
+            "budget deadline already reached",
+        ));
+    }
+    let ttl = budget.deadline.saturating_duration_since(Instant::now());
     let root = std::fs::symlink_metadata(path).map_err(|_| {
         GitError::new(
             GitErrorCode::NotFound,
@@ -546,8 +569,29 @@ pub async fn measure_size(path: &Path, budget: &Budget) -> Result<Size, GitError
             quality: SizeQuality::Complete,
         });
     }
+    // The walk runs on the blocking pool so it cannot stall the runtime.
+    let walk_root = path.to_path_buf();
+    let deadline = budget.deadline;
+    let max_entries = budget.max_entries;
+    let walk =
+        tokio::task::spawn_blocking(move || size_walk(&root, &walk_root, deadline, max_entries));
+    match timeout(ttl, walk).await {
+        Ok(Ok(size)) => Ok(size),
+        Ok(Err(error)) => Err(GitError::new(
+            GitErrorCode::ExecutionFailed,
+            format!("size walk failed: {error}"),
+        )),
+        Err(_) => Err(GitError::new(
+            GitErrorCode::Timeout,
+            "size walk exceeded the operation deadline",
+        )),
+    }
+}
+
+/// Synchronous bounded directory walk backing `measure_size`.
+fn size_walk(root: &std::fs::Metadata, path: &Path, deadline: Instant, max_entries: usize) -> Size {
     let root_device = root.dev();
-    let mut bytes = allocated(&root);
+    let mut bytes = allocated(root);
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut stack = vec![path.to_path_buf()];
     let mut entries = 0usize;
@@ -561,7 +605,7 @@ pub async fn measure_size(path: &Path, budget: &Budget) -> Result<Size, GitError
             }
         };
         for entry in reader {
-            if Instant::now() >= budget.deadline || entries >= budget.max_entries {
+            if Instant::now() >= deadline || entries >= max_entries {
                 complete = false;
                 break 'walk;
             }
@@ -595,14 +639,14 @@ pub async fn measure_size(path: &Path, budget: &Budget) -> Result<Size, GitError
             }
         }
     }
-    Ok(Size {
+    Size {
         bytes,
         quality: if complete {
             SizeQuality::Complete
         } else {
             SizeQuality::LowerBound
         },
-    })
+    }
 }
 
 /// Whether a subprocess call is a read or an already-dispatched mutation.
@@ -674,6 +718,10 @@ async fn run_git(
 }
 
 /// Runs one bounded subprocess: deadline, output cap and kill on drop.
+///
+/// Repository-selecting `GIT_*` variables inherited from this process are
+/// removed: with, say, `GIT_DIR` exported by the caller's environment, every
+/// invocation would silently bind to the wrong repository.
 async fn run_captured(
     program: &str,
     argv: &[OsString],
@@ -702,6 +750,13 @@ async fn run_captured(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_CEILING_DIRECTORIES")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -740,7 +795,10 @@ async fn run_captured(
         }),
         Ok(Err(error)) => {
             // The child is killed when it is dropped with the async block.
-            let code = if op == Op::Mutation && error.code == GitErrorCode::InvalidOutput {
+            // Anything failing after spawn (pipe read, cap, wait) may already
+            // have taken effect for a mutation, so mutations never report a
+            // definite read-style failure here.
+            let code = if op == Op::Mutation {
                 GitErrorCode::OutcomeUnknown
             } else {
                 error.code
@@ -868,15 +926,17 @@ fn unavailable<T>(error: &GitError) -> Probe<T> {
 /// Resolves the per-worktree Git directory holding HEAD, index and reflog.
 ///
 /// The main worktree uses the common directory directly; linked worktrees ask
-/// Git, falling back to the `worktrees/<name>` layout when the working tree is
-/// missing and Git can no longer answer.
+/// Git. When the working tree is missing and Git can no longer answer, the
+/// `worktrees/<name>` admin layout is used only if its `gitdir` file still
+/// points back at this registration's working tree; otherwise `None` leaves
+/// the activity signals unknown.
 async fn worktree_gitdir(
     common_dir: &Path,
     registration: &Registration,
     budget: &Budget,
-) -> PathBuf {
+) -> Option<PathBuf> {
     if registration.is_main {
-        return common_dir.to_path_buf();
+        return Some(common_dir.to_path_buf());
     }
     let args = s(&["rev-parse", "--path-format=absolute", "--git-dir"]);
     if let Ok(out) = run_git(&args, Some(&registration.path), budget, Op::Read).await
@@ -886,17 +946,21 @@ async fn worktree_gitdir(
         if let Some(line) = text.lines().next() {
             let parsed = PathBuf::from(line.trim());
             if parsed.is_absolute() {
-                return parsed;
+                return Some(parsed);
             }
         }
     }
-    common_dir
-        .join("worktrees")
-        .join(registration.path.file_name().unwrap_or(OsStr::new("")))
+    let name = registration.path.file_name()?;
+    let candidate = common_dir.join("worktrees").join(name);
+    let recorded = std::fs::read_to_string(candidate.join("gitdir")).ok()?;
+    (Path::new(recorded.trim()) == registration.path).then_some(candidate)
 }
 
 /// Reads the cheap HEAD/index mtimes and the latest reflog timestamp.
-fn activity_signals(gitdir: &Path) -> ActivitySignals {
+fn activity_signals(gitdir: Option<&Path>) -> ActivitySignals {
+    let Some(gitdir) = gitdir else {
+        return ActivitySignals::default();
+    };
     ActivitySignals {
         head_mtime: mtime_secs(&gitdir.join("HEAD")),
         index_mtime: mtime_secs(&gitdir.join("index")),
@@ -916,15 +980,23 @@ fn mtime_secs(path: &Path) -> Option<u64> {
 }
 
 /// Timestamp inside the LAST entry of a HEAD reflog, not the file's mtime.
+///
+/// Reads at most the final 4 KiB of the file, so arbitrarily long-lived
+/// worktrees with huge reflogs stay cheap; any error yields `None`.
 fn last_reflog_secs(path: &Path) -> Option<u64> {
-    let data = std::fs::read(path).ok()?;
-    // The final entry is far below 4 KiB; reading only the tail keeps huge
-    // reflogs cheap.
-    let start = data.len().saturating_sub(4096);
-    let line = data[start..]
-        .split(|&byte| byte == b'\n')
-        .rev()
-        .find(|candidate| !candidate.is_empty())?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(4096);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = vec![0u8; (len - start) as usize];
+    file.read_exact(&mut tail).ok()?;
+    let mut lines = tail.split(|&byte| byte == b'\n');
+    if start > 0 {
+        // After seeking mid-file the first chunk line may be partial.
+        lines.next()?;
+    }
+    let line = lines.rev().find(|candidate| !candidate.is_empty())?;
     let upto_message = &line[..line
         .iter()
         .position(|&byte| byte == b'\t')
@@ -1107,23 +1179,54 @@ fn hex_digest(bytes: &[u8]) -> String {
     out
 }
 
-/// Resolves a prune admin-directory name to the worktree path Git recorded.
+/// Maps each admin directory under `worktrees/` to its recorded working tree.
 ///
-/// Prune output names `worktrees/<name>` directories; the matching registration
-/// carries the actual working tree path, with the admin layout as fallback.
-fn resolve_worktree_path(common_dir: &Path, registrations: &[Registration], name: &str) -> PathBuf {
-    registrations
-        .iter()
-        .find(|registration| {
-            registration
-                .path
-                .file_name()
-                .is_some_and(|file_name| file_name == OsStr::new(name))
-        })
-        .map_or_else(
-            || common_dir.join("worktrees").join(name),
-            |registration| registration.path.clone(),
-        )
+/// Each admin entry's `gitdir` file holds the working tree path, which is the
+/// only truthful way back from a prune output name to a worktree path.
+fn admin_map(common_dir: &Path) -> HashMap<String, PathBuf> {
+    let mut map = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Ok(recorded) = std::fs::read_to_string(entry.path().join("gitdir")) {
+            // The admin `gitdir` file names the worktree's `.git` entry (a
+            // file for linked worktrees); the working tree is its parent.
+            let git_entry = PathBuf::from(recorded.trim());
+            let worktree = match git_entry.parent() {
+                Some(parent)
+                    if git_entry
+                        .file_name()
+                        .is_some_and(|n| n == OsStr::new(".git")) =>
+                {
+                    parent.to_path_buf()
+                }
+                _ => git_entry,
+            };
+            map.insert(name, worktree);
+        }
+    }
+    map
+}
+
+/// Resolves a prune admin-directory name to its working tree path.
+///
+/// A matching registration confirms the recorded path; without one the recorded
+/// path is still a real working tree, while an unreadable admin entry yields
+/// `None`. An admin directory is never reported as a worktree path.
+fn resolve_worktree_path(
+    admins: &HashMap<String, PathBuf>,
+    registrations: &[Registration],
+    name: &str,
+) -> Option<PathBuf> {
+    let recorded = admins.get(name)?;
+    Some(
+        registrations
+            .iter()
+            .find(|registration| same_tree(&registration.path, recorded, recorded))
+            .map_or(recorded.clone(), |registration| registration.path.clone()),
+    )
 }
 
 /// Allocated bytes on disk for one metadata record.
@@ -1132,10 +1235,16 @@ fn allocated(meta: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "Test assertions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::await_holding_lock,
+    reason = "Test assertions, plus a deliberately held guard that serializes env-editing tests across awaits"
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
 
     /// Runs a synchronous Git call for fixture setup only.
@@ -1178,6 +1287,16 @@ mod tests {
     /// Canonical path of a fixture directory, as Git records it.
     fn canon(path: &Path) -> PathBuf {
         std::fs::canonicalize(path).unwrap()
+    }
+
+    /// Serializes tests while one of them edits process environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquires the environment lock for the whole test body.
+    fn env_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Adds a linked worktree with a branch named after the directory.
@@ -1246,6 +1365,7 @@ mod tests {
 
     #[tokio::test]
     async fn common_dir_is_shared_across_worktrees() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let wt = dir.path().join("wt");
         add_worktree(&main, &wt, &[]);
@@ -1259,6 +1379,7 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_reports_registration_facts() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let wt = dir.path().join("wt");
         let detached = dir.path().join("det");
@@ -1298,6 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn observe_reports_status_signals_and_integration() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let wt = dir.path().join("wt");
         add_worktree(&main, &wt, &[]);
@@ -1408,6 +1530,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_adds_worktree_suppressing_hooks_and_refuses_conflicts() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let hook = main.join(".git/hooks/post-checkout");
         std::fs::write(&hook, "#!/bin/sh\necho ran > \"$PWD/hook-ran.txt\"\n").unwrap();
@@ -1488,6 +1611,22 @@ mod tests {
         .unwrap();
         assert_eq!(created.branch.as_deref(), Some("feat"));
 
+        // base plus an existing branch is refused instead of dropping base.
+        let error = create(
+            &cd,
+            &CreateSpec {
+                name: &name,
+                destination: &dir.path().join("root/bb"),
+                base: Some("main"),
+                branch: Some("feat"),
+                detached: false,
+            },
+            &budget_secs(60),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, GitErrorCode::Conflict);
+
         // Detached creation has no branch but a concrete HEAD.
         let detached_dest = dir.path().join("root/detwt");
         let created = create(
@@ -1540,6 +1679,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_refuses_dirty_then_succeeds_and_replays_absent() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let wt = dir.path().join("wt");
         add_worktree(&main, &wt, &[]);
@@ -1573,6 +1713,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_dry_run_lists_candidates_and_apply_removes_them() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let gone = dir.path().join("gone");
         add_worktree(&main, &gone, &["--detach"]);
@@ -1607,6 +1748,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_budget_times_out_and_output_cap_fails_loudly() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let expired = Budget {
             deadline: Instant::now() - Duration::from_secs(1),
@@ -1663,6 +1805,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_process_with_cwd_inside_is_detected() {
+        let _env = env_guard();
         let (dir, main) = repo_with_commit();
         let wt = dir.path().join("wt");
         add_worktree(&main, &wt, &[]);
@@ -1680,5 +1823,74 @@ mod tests {
         assert!(outside.is_err() || outside.unwrap().is_empty());
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn inherited_environment_cannot_rebind_the_repository() {
+        let _env = env_guard();
+        let (_dir_a, main_a) = repo_with_commit();
+        let (_dir_b, main_b) = repo_with_commit();
+        // As if the server process itself had been started inside repo A.
+        // SAFETY: every Git-spawning test holds ENV_LOCK, so no other thread
+        // reads or writes the environment while the variables are set.
+        unsafe {
+            std::env::set_var("GIT_DIR", main_a.join(".git"));
+            std::env::set_var("GIT_WORK_TREE", &main_a);
+        }
+        let resolved = common_dir(&main_b, &budget_secs(30)).await;
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+            std::env::remove_var("GIT_WORK_TREE");
+        }
+        assert_eq!(
+            resolved.unwrap(),
+            std::fs::canonicalize(main_b.join(".git")).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn ignored_only_worktree_is_reported_and_removable() {
+        let _env = env_guard();
+        let (dir, main) = repo_with_commit();
+        let wt = dir.path().join("wt");
+        add_worktree(&main, &wt, &[]);
+        std::fs::create_dir_all(wt.join("ign")).unwrap();
+        std::fs::write(wt.join("ign/x.log"), "x\n").unwrap();
+        let cd = common_dir(&main, &budget_secs(30)).await.unwrap();
+        let observed = observe(
+            &cd,
+            &ObserveSpec {
+                worktree_path: &wt,
+                integration_ref: None,
+                checks: Checks {
+                    status: true,
+                    ..Default::default()
+                },
+            },
+            &budget_secs(60),
+        )
+        .await
+        .unwrap();
+        let Probe::Known(facts) = &observed.status else {
+            panic!("status probe not known: {:?}", observed.status);
+        };
+        assert_eq!(facts.ignored, vec!["ign/".to_owned()]);
+        assert_eq!(
+            (
+                facts.staged,
+                facts.unstaged,
+                facts.untracked,
+                facts.conflicts
+            ),
+            (0, 0, 0, 0)
+        );
+        // Git removes ignored-only worktrees without --force; the caller-side
+        // IgnoredNotDisposable veto is the only guard, as documented on remove.
+        assert_eq!(
+            remove(&cd, &wt, &budget_secs(60)).await.unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert!(!wt.exists());
     }
 }
