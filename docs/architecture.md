@@ -76,9 +76,12 @@ reason }`, so an unknown check is never mistaken for a clean result.
 | size | `complete`, `lower_bound`, `not_checked` | warning at ≥ 2 GiB |
 
 Thresholds live in `Policy` (with its own `revision`, part of the removal
-fingerprint). Between "recent" and "idle" the classification stays `recent` —
-claiming activity longer is the conservative direction; missing signals yield
-`unknown`, never proof of abandonment.
+fingerprint) and must be ordered `recent_after_secs` ≤ `idle_after_secs` ≤
+`stale_after_secs`; `Policy::validate` rejects inverted thresholds. Age up to
+`recent_after_secs` is `recent`; the gap between "recent" and "idle" also stays
+`recent` — claiming activity longer is the conservative direction; missing
+signals yield `unknown`, never proof of abandonment. A signal timestamped in
+the future counts as age zero (clock-skew tolerance).
 
 Signals, strongest first:
 
