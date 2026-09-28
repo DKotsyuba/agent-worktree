@@ -77,6 +77,9 @@ fn coverage_label(coverage: &Coverage) -> String {
     if coverage.orphan_scan_truncated {
         text.push_str("; orphan scan hit its entry cap");
     }
+    if coverage.root_unconfigured {
+        text.push_str("; worktree root not configured; orphan scan skipped");
+    }
     text
 }
 
@@ -262,10 +265,12 @@ mod tests {
             failed: vec![("deadbeefcafe".to_owned(), "timeout")],
             budget_exhausted: true,
             orphan_scan_truncated: false,
+            root_unconfigured: true,
         };
         let label = coverage_label(&coverage);
         assert!(label.contains("deadbeefcafe(timeout)"));
         assert!(label.contains("budget exhausted"));
+        assert!(label.contains("worktree root not configured"));
     }
 
     #[tokio::test]

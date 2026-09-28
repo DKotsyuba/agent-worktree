@@ -17,7 +17,7 @@ use mcp_presentation::Renderer;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext,
 };
-use std::{path::PathBuf, process::ExitCode, sync::Arc};
+use std::{io, io::Write as _, path::PathBuf, process::ExitCode, sync::Arc};
 
 #[derive(Parser)]
 #[command(
@@ -172,7 +172,9 @@ impl ServerHandler for Handler {
 fn print_json(value: impl serde::Serialize) -> ExitCode {
     match serde_json::to_string_pretty(&value) {
         Ok(text) => {
-            println!("{text}");
+            // A closed pipe (EPIPE) is ignored, never a panic: CLI output is
+            // best-effort.
+            let _ = writeln!(io::stdout().lock(), "{text}");
             ExitCode::SUCCESS
         }
         Err(_) => {
@@ -184,7 +186,8 @@ fn print_json(value: impl serde::Serialize) -> ExitCode {
 
 /// Prints one `UserPromptSubmit` context envelope, mirroring the shape
 /// `agent-run hook context` emits for both Claude Code and Codex; an empty
-/// `text` prints nothing at all.
+/// `text` prints nothing at all. Write failures (EPIPE) are ignored — the
+/// hook must always exit 0 quietly.
 #[allow(
     clippy::print_stdout,
     reason = "Explicit hook branch, never MCP output"
@@ -196,7 +199,7 @@ fn print_context(text: &str) {
             "additionalContext": text
         }
     });
-    println!("{envelope}");
+    let _ = writeln!(io::stdout().lock(), "{envelope}");
 }
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -228,8 +231,38 @@ async fn main() -> ExitCode {
         },
         Commands::Doctor { json: _ } => {
             let ready = Handler::new().is_ok();
+            // The layout facts doctor reports: home, config path, the
+            // configured worktree root (there is no default) and the
+            // discovery roots, all after `~/` expansion.
+            let env_home = std::env::var_os("AGENT_WORKTREE_HOME").map(PathBuf::from);
+            let platform_home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let home = env_home
+                .clone()
+                .unwrap_or_else(|| platform_home.join(".agent-worktree"));
+            let layout = store::resolve_layout(env_home, platform_home);
+            let (root, discovery_roots) = match &layout {
+                Ok(layout) => (
+                    layout
+                        .root
+                        .as_ref()
+                        .map_or("not configured".to_owned(), |root| {
+                            root.display().to_string()
+                        }),
+                    layout
+                        .config
+                        .discovery_roots
+                        .iter()
+                        .map(|root| root.display().to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                Err(error) => (format!("invalid_config: {}", error.detail), Vec::new()),
+            };
             let output = print_json(
                 serde_json::json!({"product":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),
+                "home":home.display().to_string(),"config":home.join("config.toml").display().to_string(),
+                "worktree_root":root,"discovery_roots":discovery_roots,
                 "local_ready":ready,"release_qualification":"not_verified","incomplete_tools":tools::incomplete()}),
             );
             if ready { output } else { ExitCode::from(2) }

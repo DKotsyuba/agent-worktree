@@ -10,10 +10,14 @@ product state only adds what cannot be reconstructed from Git.
 
 ## Locations, identity and naming
 
-- Product home: `~/.agent-worktree/`, overridable with `AGENT_WORKTREE_HOME`.
-- Worktree root: `<home>/worktrees`; precedence `AGENT_WORKTREE_ROOT` >
-  `config.toml` (`[storage] root`) > default. Changing the root affects future
-  creation only.
+- Product home: `~/.agent-worktree/`, moved wholesale with
+  `AGENT_WORKTREE_HOME` (which also moves where `config.toml` is read from).
+- Worktree root: only `[storage] root` in `<home>/config.toml` — no default
+  location, no environment override. A leading `~/` expands to the real home;
+  anything else must be absolute (relative values refuse as `invalid_config`).
+  Without a root, creation refuses `root_not_configured` and every other
+  operation works (the own-root orphan scan is skipped with a coverage note).
+  Changing the root affects future creation only.
 - Repository identity: SHA-256 of the canonical absolute Git common directory,
   hashed with a versioned encoding (`aw-repo-id-v1`). Linked worktrees share one
   identity; independent clones remain distinct. Moving a repository changes its
@@ -149,7 +153,10 @@ same scope as a repo-less `list_worktrees` with the same cheap page signals,
 and when a linked worktree crosses the idle threshold it injects one bounded
 `<agent-worktree>` block — once per (canonical path, last-activity) episode,
 recorded in `<home>/state/v1/notify.json`, rate-limited to one scan per
-10 minutes, always exit 0 within a 3 s deadline. It never mutates
+10 minutes, always exit 0 within a 3 s deadline. A recorded episode is
+dropped only on positive evidence (newer activity on the path, or the
+registration absent from every successfully inventoried repository), never
+because one repository's scan failed. It never mutates
 repositories. Details: docs/notifications.md.
 
 ## Pruning

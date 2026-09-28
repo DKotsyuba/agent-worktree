@@ -1,8 +1,9 @@
 //! End-to-end tool lifecycle over stdio with real repositories.
 //!
-//! Each test spawns the real binary with an isolated `AGENT_WORKTREE_HOME` and
-//! `AGENT_WORKTREE_ROOT` in a temp directory and drives it through the pinned
-//! SDK, so every reply is exactly what a host would see.
+//! Each test spawns the real binary with an isolated `AGENT_WORKTREE_HOME`
+//! (whose `config.toml` configures the worktree root) in a temp directory and
+//! drives it through the pinned SDK, so every reply is exactly what a host
+//! would see.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -149,17 +150,23 @@ fn record_file(home: &std::path::Path, name: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| panic!("record file for {name} exists"))
 }
 
-/// Spawns the server with an isolated product home and worktree root.
+/// Spawns the server with an isolated product home whose `config.toml`
+/// configures the worktree root (the only place a root can come from).
 async fn spawn(
     home: &std::path::Path,
 ) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
+    std::fs::create_dir_all(home.join("product")).unwrap();
+    std::fs::write(
+        home.join("product/config.toml"),
+        format!("[storage]\nroot = \"{}\"\n", home.join("wt-root").display()),
+    )
+    .unwrap();
     let mut command = tokio::process::Command::new(binary());
     command
         .arg("mcp")
         .env_clear()
         .env("HOME", home)
         .env("AGENT_WORKTREE_HOME", home.join("product"))
-        .env("AGENT_WORKTREE_ROOT", home.join("wt-root"))
         .env(
             "PATH",
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
@@ -223,6 +230,25 @@ fn hook_context(home: &std::path::Path, extra_env: &[(&str, &str)]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Spawns `hook context` without waiting, for concurrency tests; stdout is
+/// piped so the announcement can be captured per process.
+fn hook_context_spawned(home: &std::path::Path) -> std::process::Child {
+    let mut command = Command::new(binary());
+    command
+        .args(["hook", "context", "--host", "claude"])
+        .env_clear()
+        .env("HOME", home)
+        .env("AGENT_WORKTREE_HOME", home.join("product"))
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        )
+        .current_dir(home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    command.spawn().unwrap()
 }
 
 /// Rewrites notify.json with `last_scan_at = 0` so the next run rescans.
@@ -357,6 +383,65 @@ async fn create_list_inspect_lifecycle() {
         );
         assert!(text.contains("session=sess-7"), "{text}");
         let _ = path;
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+/// Without `[storage] root` creation refuses naming the config file, while
+/// listing still works and says the orphan scan was skipped.
+#[tokio::test]
+async fn create_refuses_without_a_configured_root() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let f = fixture().await;
+        // The service re-reads config.toml per call; drop the root.
+        std::fs::write(
+            f.home.path().join("product/config.toml"),
+            format!("[discovery]\nroots = [\"{}\"]\n", f.home.path().display()),
+        )
+        .unwrap();
+        let repo = f.repo.display().to_string();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "task-9", "creator": "claude-code",
+                "purpose": "prove the refusal"}),
+        )
+        .await;
+        assert!(error, "{text}");
+        assert!(
+            text.starts_with(
+                "ERROR root_not_configured: no worktree root is configured; set one in "
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                f.home
+                    .path()
+                    .join("product/config.toml")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "{text}"
+        );
+        assert!(text.contains("[storage]"), "{text}");
+
+        // Listing keeps working and names the skipped orphan scan.
+        let (error, text) = call_text(
+            &f._client,
+            "list_worktrees",
+            serde_json::json!({"repo": &repo}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert!(
+            text.contains("worktree root not configured; orphan scan skipped"),
+            "{text}"
+        );
 
         f._client.cancel().await.unwrap();
     })
@@ -1141,22 +1226,14 @@ async fn hook_context_notifies_once_per_idle_episode() {
             .as_str()
             .unwrap();
         let canonical = std::fs::canonicalize(&wt).unwrap();
-        // Mergedness may degrade to `unknown` under the hook's deadline; the
-        // row identity must not.
+        // On this unloaded single-repo fixture the cheap merge-base probe is
+        // deterministic: wt-old sits exactly at the integration tip, so the
+        // mergedness label is pinned, not accepted loosely.
         assert!(
             text.starts_with(
-                "<agent-worktree>\n1 worktree(s) have had no activity for over 24 h:\n- repo/wt-old — idle 2 d, "
+                "<agent-worktree>\n1 worktree(s) have had no activity for over 24 h:\n- repo/wt-old — idle 2 d, merged, "
             ),
             "{text}"
-        );
-        let label = text
-            .lines()
-            .nth(2)
-            .and_then(|row| row.split(", ").nth(1))
-            .unwrap_or_default();
-        assert!(
-            ["merged", "unmerged", "unknown"].contains(&label),
-            "mergedness label: {label}"
         );
         assert!(
             text.contains(canonical.display().to_string().as_str()),
@@ -1182,7 +1259,8 @@ async fn hook_context_notifies_once_per_idle_episode() {
         );
 
         // Activity closes the episode; idle again opens a new one. The fresh
-        // commit is off main, so the second block reports unmerged.
+        // commit is off main, so the second block reports unmerged — pinned,
+        // not accepted loosely, same as the first block.
         git(&wt, &["commit", "--quiet", "--allow-empty", "-m", "fresh"]);
         clear_last_scan(home.path());
         assert_eq!(hook_context(home.path(), &[]), "");
@@ -1198,11 +1276,119 @@ async fn hook_context_notifies_once_per_idle_episode() {
             "{text}"
         );
         assert!(
-            text.contains("- repo/wt-old — idle 2 d, merged, ")
-                || text.contains("- repo/wt-old — idle 2 d, unmerged, ")
-                || text.contains("- repo/wt-old — idle 2 d, unknown, "),
+            text.contains("- repo/wt-old — idle 2 d, unmerged, "),
             "{text}"
         );
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+/// The episode state survives a scan in which the owning repository's
+/// inventory fails, and the recovered scan does not re-announce.
+#[tokio::test]
+async fn hook_keeps_episodes_across_a_failing_repository_scan() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        init_repo(&repo);
+        std::fs::create_dir_all(home.path().join("product")).unwrap();
+        std::fs::write(
+            home.path().join("product/config.toml"),
+            format!("[discovery]\nroots = [\"{}\"]\n", home.path().display()),
+        )
+        .unwrap();
+        let wt = home.path().join("wt-old");
+        git(
+            &repo,
+            &["worktree", "add", "--quiet", &wt.display().to_string()],
+        );
+        age_worktree(&repo.join(".git").join("worktrees").join("wt-old"), 2);
+        age_worktree(&repo.join(".git"), 40);
+
+        // Announce once.
+        let stdout = hook_context_prints(home.path(), 6);
+        assert!(stdout.contains("1 worktree(s)"), "{stdout}");
+
+        // Break the repository: discovery still resolves the scope (`.git`
+        // exists) but the inventory subprocess fails — a transient omission,
+        // not a removed worktree.
+        std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        clear_last_scan(home.path());
+        assert_eq!(hook_context(home.path(), &[]), "");
+        let state: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("product/state/v1/notify.json")).unwrap(),
+        )
+        .unwrap();
+        let canonical = std::fs::canonicalize(&wt).unwrap();
+        assert!(
+            state["episodes"]
+                .as_array()
+                .is_some_and(|episodes| !episodes.is_empty()),
+            "the failing scan must not drop recorded episodes: {state}"
+        );
+        assert_eq!(
+            state["episodes"][0]["path"],
+            canonical.display().to_string(),
+            "{state}"
+        );
+
+        // Repository back: the still-recorded episode is not re-announced.
+        std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        clear_last_scan(home.path());
+        assert_eq!(hook_context(home.path(), &[]), "");
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+/// Two hook processes racing on one home announce exactly one block.
+#[tokio::test]
+async fn two_concurrent_hooks_announce_exactly_once() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        init_repo(&repo);
+        std::fs::create_dir_all(home.path().join("product")).unwrap();
+        std::fs::write(
+            home.path().join("product/config.toml"),
+            format!("[discovery]\nroots = [\"{}\"]\n", home.path().display()),
+        )
+        .unwrap();
+        let wt = home.path().join("wt-old");
+        git(
+            &repo,
+            &["worktree", "add", "--quiet", &wt.display().to_string()],
+        );
+        age_worktree(&repo.join(".git").join("worktrees").join("wt-old"), 2);
+        age_worktree(&repo.join(".git"), 40);
+        let _ = std::fs::remove_file(home.path().join("product/state/v1/notify.json"));
+
+        // Two hooks start before either can stamp a scan.
+        let first = hook_context_spawned(home.path());
+        let second = hook_context_spawned(home.path());
+        let outputs: Vec<String> = [first, second]
+            .into_iter()
+            .map(|child| {
+                let output = child.wait_with_output().unwrap();
+                assert!(output.status.success(), "hook must always exit 0");
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            })
+            .collect();
+        let announcements = outputs
+            .iter()
+            .filter(|stdout| !stdout.trim().is_empty())
+            .count();
+        assert_eq!(announcements, 1, "{outputs:?}");
+        // Exactly one episode was recorded for the idle worktree.
+        let state: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("product/state/v1/notify.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["episodes"].as_array().map(Vec::len), Some(1));
     })
     .await
     .expect("e2e deadline");

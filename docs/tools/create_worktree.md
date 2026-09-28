@@ -45,6 +45,8 @@ stored in the record and compared on replay.
   with a different metadata binding, the path exists on disk, or the existing
   registration's path is gone (hint: prune first). Nothing is overwritten and
   no suffix is invented.
-- `root_not_absolute` — the worktree root is not an absolute path.
+- `root_not_configured` — no `[storage] root` in `<home>/config.toml`; the
+  refusal names that file and an example `[storage]` block. A relative
+  configured root refuses as `invalid_config`.
 - `lock_timeout` — the per-repository lock was busy past the 30 s deadline.
 - `not_a_repository` — `repo` does not resolve to a Git repository.

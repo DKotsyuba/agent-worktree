@@ -15,6 +15,7 @@ use crate::worktree::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -192,25 +193,17 @@ impl Service {
         Ok(Self { policy })
     }
 
-    /// Resolves the product home and worktree root from the environment.
+    /// Resolves the product home and configuration from the environment.
+    ///
+    /// The worktree root is `None` until `[storage] root` is configured; only
+    /// creation requires one (see [`Service::create_worktree`]), and relative
+    /// configured paths are already refused by config parsing.
     fn layout(&self) -> Result<Layout, ServiceError> {
         let env_home = std::env::var_os("AGENT_WORKTREE_HOME").map(PathBuf::from);
-        let env_root = std::env::var_os("AGENT_WORKTREE_ROOT").map(PathBuf::from);
         let platform_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
-        let layout =
-            store::resolve_layout(env_home, env_root, platform_home).map_err(store_error)?;
-        // A relative root would make Git create worktrees inside the working
-        // directory or the repository's own administration tree.
-        if !layout.root.is_absolute() {
-            return Err(ServiceError::blocked(
-                "root_not_absolute",
-                "the worktree root must be an absolute path",
-            )
-            .with_next("set AGENT_WORKTREE_ROOT or [storage] root to an absolute path"));
-        }
-        Ok(layout)
+        store::resolve_layout(env_home, platform_home).map_err(store_error)
     }
 
     /// Resolves the repository scope entry for one caller-supplied repo path.
@@ -234,9 +227,20 @@ impl Service {
     pub async fn create_worktree(&self, args: &CreateArgs) -> Result<CreateOutcome, ServiceError> {
         let name = args.validate()?;
         let layout = self.layout()?;
+        // The root exists only through configuration; there is no default.
+        let Some(root) = layout.root.clone() else {
+            let config_path = layout.home.join("config.toml");
+            return Err(ServiceError::blocked(
+                "root_not_configured",
+                format!(
+                    "no worktree root is configured; set one in {}",
+                    config_path.display()
+                ),
+            )
+            .with_next("example:\n[storage]\nroot = \"~/projects/worktrees\""));
+        };
         let scope = self.repo_scope(&layout, &args.repo).await?;
-        let destination = layout
-            .root
+        let destination = root
             .join(worktree::repo_directory(&scope.label, &scope.repo_id))
             .join(name.as_str());
         let key = format!("{}/{}", scope.repo_id.id12(), name.as_str());
@@ -446,6 +450,7 @@ impl Service {
         let mut rows: Vec<ListRow> = Vec::new();
         let mut facts: Vec<(String, PathBuf, Option<String>)> = Vec::new();
         let mut orphan_scan_truncated = false;
+        let mut root_unconfigured = false;
         for (index, scope) in scopes.iter().enumerate() {
             if Instant::now() >= overall.deadline {
                 // Scopes past the call deadline are named, not silently absent.
@@ -507,9 +512,15 @@ impl Service {
                     .clone()
                     .or_else(|| derived_integration(&inventory)),
             ));
-            let repo_dir = layout
-                .root
-                .join(worktree::repo_directory(&scope.label, &scope.repo_id));
+            let Some(worktree_root) = &layout.root else {
+                // No configured root: no per-repo directory of ours exists to
+                // scan. Named in coverage so `orphan=0` is never read as
+                // "scanned and found none".
+                root_unconfigured = true;
+                continue;
+            };
+            let repo_dir =
+                worktree_root.join(worktree::repo_directory(&scope.label, &scope.repo_id));
             let entries = match std::fs::read_dir(&repo_dir) {
                 Ok(entries) => Some(entries),
                 Err(error) => {
@@ -600,6 +611,7 @@ impl Service {
                 failed,
                 budget_exhausted,
                 orphan_scan_truncated,
+                root_unconfigured,
             },
             hygiene,
         })
@@ -725,15 +737,20 @@ impl Service {
     /// the last reflog entry, never a status walk, lsof or size measurement.
     /// A worktree is idle when its newest signal is at least
     /// `Policy::idle_after_secs` old; repositories, worktrees and probes that
-    /// fail are skipped, because the hook must never fail the host. `None`
-    /// means the pass is incomplete — scope resolution failed or `deadline`
-    /// ran out — and the caller must treat that as "no answer", never as an
-    /// empty result, so a truncated scan can neither notify nor rewrite the
-    /// episode state.
-    pub async fn idle_worktrees(&self, deadline: Instant) -> Option<Vec<IdleRow>> {
+    /// fail are skipped, because the hook must never fail the host — a failed
+    /// repository marks the pass [`IdleScan::incomplete`] instead of shrinking
+    /// the answer. `None` means the pass is incomplete — scope resolution
+    /// failed or `deadline` ran out — and the caller must treat that as "no
+    /// answer", never as an empty result, so a truncated scan can neither
+    /// notify nor rewrite the episode state.
+    pub async fn idle_worktrees(&self, deadline: Instant) -> Option<IdleScan> {
         let mut rows = Vec::new();
+        let mut activity = HashMap::new();
+        let mut registered = HashSet::new();
+        let mut incomplete = false;
         let layout = self.layout().ok()?;
         let all = self.all_repo_scopes(&layout).await.ok()?;
+        incomplete |= all.discovery_exhausted;
         let now = unix_now();
         for scope in all.scopes {
             if Instant::now() >= deadline {
@@ -745,6 +762,9 @@ impl Service {
                 max_entries: MAX_ENTRIES,
             };
             let Ok(inventory) = git::inventory(&scope.common_dir, &remaining).await else {
+                // Unknown, not absent: a failed inventory must not read as
+                // "its worktrees are gone" in the episode retention rule.
+                incomplete = true;
                 continue;
             };
             let integration_ref = scope
@@ -752,6 +772,7 @@ impl Service {
                 .clone()
                 .or_else(|| derived_integration(&inventory));
             for registration in &inventory {
+                registered.insert(canonical_path(&registration.path));
                 if !notifiable(registration) || !registration.path.try_exists().unwrap_or(false) {
                     continue;
                 }
@@ -781,6 +802,7 @@ impl Service {
                 else {
                     continue;
                 };
+                activity.insert(canonical_path(&registration.path), last_activity);
                 if now.saturating_sub(last_activity) < self.policy.idle_after_secs {
                     continue;
                 }
@@ -798,7 +820,12 @@ impl Service {
                 });
             }
         }
-        Some(rows)
+        Some(IdleScan {
+            rows,
+            activity,
+            registered,
+            incomplete,
+        })
     }
 
     /// Hygiene counts over exactly the rows this page collected.
@@ -1186,15 +1213,7 @@ impl Service {
                         .is_none_or(|(_, cursor_path)| path > cursor_path)
                 })
                 .collect();
-            let has_more = remaining.len() > limit;
-            let page: Vec<PathBuf> = remaining.into_iter().take(limit).collect();
-            let cursor = has_more
-                .then(|| {
-                    page.last()
-                        .map(|path| encode_prune_cursor(&scope.repo_id, path))
-                })
-                .flatten();
-            (page, has_more, cursor)
+            fit_prune_page(remaining, limit, &scope.repo_id)
         };
         Ok(PruneOutcome {
             repo_id: scope.repo_id.id12().to_owned(),
@@ -1299,13 +1318,20 @@ struct Target {
 fn replay_target(layout: &Layout, scope: &RepoScope, args: &RemoveArgs) -> (String, PathBuf) {
     // The root is canonicalized when present so the reconstructed path can be
     // compared with the record's bound path regardless of /var vs /private.
-    let root = std::fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone());
+    let root = layout
+        .root
+        .as_ref()
+        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()));
     match (&args.name, &args.path) {
-        (Some(name), None) => (
-            name.clone(),
-            root.join(worktree::repo_directory(&scope.label, &scope.repo_id))
-                .join(name),
-        ),
+        (Some(name), None) => match root {
+            Some(root) => (
+                name.clone(),
+                root.join(worktree::repo_directory(&scope.label, &scope.repo_id))
+                    .join(name),
+            ),
+            // Without a configured root the path cannot be reconstructed.
+            None => (name.clone(), PathBuf::new()),
+        },
         (_, Some(path)) => (base_name(Path::new(path)), canonicalize_gone(path)),
         _ => (String::new(), PathBuf::new()),
     }
@@ -1346,6 +1372,28 @@ pub struct IdleRow {
     /// Mergedness against the integration ref: `merged`, `unmerged` or
     /// `unknown`.
     pub merged: &'static str,
+}
+
+/// One completed notification scan: idle rows plus the facts the caller needs
+/// to keep the episode state exactly-once across transient per-repo failures.
+#[derive(Clone, Debug, Default)]
+pub struct IdleScan {
+    /// Idle linked worktrees, one row each.
+    pub rows: Vec<IdleRow>,
+    /// Canonical path → newest activity signal of every existing linked
+    /// worktree whose activity was known this pass, idle or not.
+    pub activity: HashMap<PathBuf, u64>,
+    /// Canonical paths of every registration the successfully inventoried
+    /// repositories listed (main, bare and prunable included).
+    pub registered: HashSet<PathBuf>,
+    /// True when any repository's inventory failed or discovery was cut
+    /// short, so a registration's absence proves nothing this pass.
+    pub incomplete: bool,
+}
+
+/// Canonical form of `path` when it exists on disk, else `path` unchanged.
+fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Canonicalizes a caller path for comparison with a record's bound path.
@@ -1568,6 +1616,62 @@ fn fit_rows(rows: Vec<ListRow>, limit: usize) -> PageFit {
         rows: kept,
         has_more,
     }
+}
+
+/// Fits prune-preview rows under the page row-byte budget, like [`fit_rows`]:
+/// each path line and the encoded cursor are charged against
+/// [`PAGE_ROW_BUDGET`], so many long paths page through with fewer rows per
+/// page instead of overflowing the rendered page cap. OS path limits keep one
+/// row plus its cursor far below the budget, so a page never refuses.
+fn fit_prune_page(
+    remaining: Vec<PathBuf>,
+    limit: usize,
+    repo_id: &RepoId,
+) -> (Vec<PathBuf>, bool, Option<String>) {
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(limit.min(remaining.len()));
+    let mut used = 0usize;
+    let mut has_more = false;
+    for path in remaining {
+        if kept.len() == limit {
+            has_more = true;
+            break;
+        }
+        let line = prune_line_bytes(&path);
+        // The first row is always kept so paging always advances; dropping it
+        // would refuse (or loop) on a path no OS can produce.
+        if !kept.is_empty() && used.saturating_add(line) > PAGE_ROW_BUDGET {
+            has_more = true;
+            break;
+        }
+        used += line;
+        kept.push(path);
+    }
+    // Charge the encoded cursor of the last shown row against the budget,
+    // mirroring `fit_rows`.
+    while has_more
+        && let Some(last) = kept.last()
+        && used.saturating_add(prune_cursor_bytes(repo_id, last)) > PAGE_ROW_BUDGET
+        && kept.len() > 1
+        && let Some(dropped) = kept.pop()
+    {
+        used = used.saturating_sub(prune_line_bytes(&dropped));
+    }
+    let cursor = has_more
+        .then(|| kept.last().map(|path| encode_prune_cursor(repo_id, path)))
+        .flatten();
+    (kept, has_more, cursor)
+}
+
+/// Rendered line size of one prune-preview row: the path plus the newline.
+fn prune_line_bytes(path: &Path) -> usize {
+    path.as_os_str().as_encoded_bytes().len() + 1
+}
+
+/// Upper bound of the cursor `encode_prune_cursor` emits for one position:
+/// `awprune1` + repo id (64 hex) + NUL + raw path bytes, base64 at four
+/// characters per three bytes.
+fn prune_cursor_bytes(repo_id: &RepoId, path: &Path) -> usize {
+    4 * (8 + repo_id.as_str().len() + 1 + path.as_os_str().as_encoded_bytes().len()).div_ceil(3)
 }
 
 /// Upper bound of the cursor `encode_cursor` emits for one row position.
@@ -2141,6 +2245,9 @@ pub struct Coverage {
     pub budget_exhausted: bool,
     /// Whether the per-repo orphan scan hit its entry cap without finishing.
     pub orphan_scan_truncated: bool,
+    /// Whether no worktree root is configured, so the per-repo orphan scan
+    /// was skipped entirely.
+    pub root_unconfigured: bool,
 }
 
 /// Result of a successful list call.
@@ -2455,6 +2562,54 @@ mod tests {
         // A list cursor is not a prune cursor.
         let list_cursor = encode_cursor(&[0u8; 32], id.as_str(), Path::new("/w/x"));
         assert!(parse_prune_cursor(&list_cursor).is_err());
+    }
+
+    #[test]
+    fn prune_page_shrinks_under_the_row_budget_and_pages_through() {
+        let id = RepoId::from_common_dir(Path::new("/repo/.git"));
+        // 20 long paths exceed the page budget by row count alone; the page
+        // must shrink and keep paging instead of refusing. Paths are sorted
+        // first, as the service does before keyset paging.
+        let mut paths: Vec<PathBuf> = (0..20)
+            .map(|i| PathBuf::from(format!("/w/{}-{i}", "p".repeat(500))))
+            .collect();
+        paths.sort();
+        let (page, has_more, cursor) = fit_prune_page(paths.clone(), 20, &id);
+        assert!(has_more);
+        assert!(page.len() < 20, "page must shrink: {}", page.len());
+        let used: usize = page.iter().map(|path| prune_line_bytes(path)).sum();
+        let last = page.last().unwrap();
+        assert!(used + prune_cursor_bytes(&id, last) <= PAGE_ROW_BUDGET);
+        let cursor = cursor.unwrap();
+        // Paging by cursor covers every candidate exactly once, no refusal.
+        let mut seen = page.clone();
+        let mut resume = parse_prune_cursor(&cursor).unwrap().1;
+        while seen.len() < paths.len() {
+            let remaining: Vec<PathBuf> = paths
+                .iter()
+                .filter(|path| **path > resume)
+                .cloned()
+                .collect();
+            let (next, has_more, cursor) = fit_prune_page(remaining, 20, &id);
+            assert!(!next.is_empty(), "paging must always advance");
+            seen.extend(next.iter().cloned());
+            resume = match cursor {
+                Some(cursor) => parse_prune_cursor(&cursor).unwrap().1,
+                None => break,
+            };
+            assert!(has_more);
+        }
+        seen.sort();
+        let mut expected = paths;
+        expected.sort();
+        assert_eq!(seen, expected);
+        // Small paths still fill the row-count limit.
+        let short: Vec<PathBuf> = (0..30)
+            .map(|i| PathBuf::from(format!("/w/t-{i}")))
+            .collect();
+        let (page, has_more, _) = fit_prune_page(short, 20, &id);
+        assert_eq!(page.len(), 20);
+        assert!(has_more);
     }
 
     #[test]

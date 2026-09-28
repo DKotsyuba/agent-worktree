@@ -90,6 +90,42 @@ async fn protocol() {
     .expect("protocol deadline");
 }
 #[test]
+fn doctor_reports_home_config_and_expanded_root() {
+    // The owner's config shape: `~/` in both [storage] root and discovery
+    // roots, resolved against the real home (HOME here).
+    let root = tempfile::tempdir().unwrap();
+    let product = root.path().join(".agent-worktree");
+    std::fs::create_dir_all(&product).unwrap();
+    std::fs::write(
+        product.join("config.toml"),
+        "[storage]\nroot = \"~/projects/worktrees\"\n[discovery]\nroots = [\"~/projects\"]\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(binary())
+        .arg("doctor")
+        .env_clear()
+        .env("HOME", root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let home = root.path().display().to_string();
+    assert_eq!(report["home"], format!("{home}/.agent-worktree"));
+    assert_eq!(
+        report["config"],
+        format!("{home}/.agent-worktree/config.toml")
+    );
+    assert_eq!(
+        report["worktree_root"],
+        format!("{home}/projects/worktrees")
+    );
+    assert_eq!(
+        report["discovery_roots"],
+        serde_json::json!([format!("{home}/projects")])
+    );
+}
+
+#[test]
 fn eof_releases_stdio_process() {
     let mut child = std::process::Command::new(binary())
         .arg("mcp")

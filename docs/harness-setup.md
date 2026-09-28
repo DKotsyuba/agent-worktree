@@ -6,9 +6,10 @@
 <root>/<label>--<id12>/<name>/
 ```
 
-with `<root>` = `~/.agent-worktree/worktrees` by default, overridable by
-`AGENT_WORKTREE_ROOT` or `[storage] root` in `~/.agent-worktree/config.toml`.
-The point of one shared root is that both the orchestrating agent (via this
+with `<root>` configured only in `~/.agent-worktree/config.toml`
+(`[storage] root`, a leading `~/` allowed); there is no default location, and
+`agent-worktree doctor` prints the resolved root as `worktree_root`. The point
+of one shared root is that both the orchestrating agent (via this
 MCP server) and the harness's own worktree feature land in the same place, so
 inventory, inspection and preview→apply removal cover everything.
 
@@ -17,8 +18,9 @@ inventory, inspection and preview→apply removal cover everything.
 Documented, not tested against a specific Codex build.
 
 1. Open Settings → Worktrees.
-2. Set **Worktree root** to the same directory this product uses:
-   `~/.agent-worktree/worktrees`.
+2. Set **Worktree root** to the same directory this product uses — the
+   `worktree_root` `agent-worktree doctor` prints (read it from
+   `~/.agent-worktree/config.toml`, `[storage] root`).
 3. Keep the harness's own branch naming; this product classifies harness-made
    worktrees as `foreign` (registered with Git, no record) and never treats
    them as managed, so `remove_worktree` still previews them with full checks.
@@ -55,7 +57,8 @@ with `aw-create-hook` on `PATH`:
 # Reads the worktree request as JSON on stdin; creates the worktree under the
 # agent-worktree root; prints the absolute path on stdout.
 set -eu
-root="${AGENT_WORKTREE_ROOT:-$HOME/.agent-worktree/worktrees}"
+root=$(agent-worktree doctor | jq -r '.worktree_root // empty')
+[ -n "$root" ] || exit 1
 repo=$(jq -r '.repo // .cwd // empty')
 name=$(jq -r '.name // empty')
 [ -n "$repo" ] && [ -n "$name" ] || exit 1

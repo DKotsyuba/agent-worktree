@@ -108,50 +108,57 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// Parsed `config.toml` contents; absent file means defaults.
+/// Parsed `config.toml` contents; absent file means defaults. Paths are
+/// stored expanded: a leading `~/` resolves against the real home.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Config {
-    /// Worktree root override (`[storage] root`).
+    /// Worktree root (`[storage] root`); `None` when not configured.
     pub root: Option<PathBuf>,
     /// Roots scanned for repository discovery (`[discovery] roots`).
     pub discovery_roots: Vec<PathBuf>,
 }
 
-/// Resolved product home, worktree root and configuration.
+/// Resolved product home and configuration.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Layout {
     /// Product home, `~/.agent-worktree/` by default.
     pub home: PathBuf,
-    /// Worktree root, `<home>/worktrees` by default.
-    pub root: PathBuf,
+    /// Worktree root from `[storage] root`; `None` until the owner configures
+    /// one — there is no built-in default location.
+    pub root: Option<PathBuf>,
     /// Parsed configuration; defaults when no `config.toml` exists.
     pub config: Config,
 }
 
-/// Resolves home and worktree root.
+/// Resolves home and configuration.
 ///
-/// Precedence: `AGENT_WORKTREE_HOME` beats the platform home; `AGENT_WORKTREE_ROOT`
-/// beats `config.toml`, which beats `<home>/worktrees`. The configuration is read
-/// from `<home>/config.toml`; an absent file means defaults, and an invalid or
-/// unknown-key file refuses resolution with `StoreErrorCode::InvalidConfig`.
+/// `AGENT_WORKTREE_HOME` moves the whole product home (including where
+/// `config.toml` is read from); otherwise the home is
+/// `<platform home>/.agent-worktree`. The worktree root comes only from
+/// `[storage] root` in `<home>/config.toml`. A leading `~/` in `root` or any
+/// `[discovery] roots` entry expands against the platform home; every
+/// configured path must be absolute after that, and a relative value refuses
+/// resolution with `StoreErrorCode::InvalidConfig`. An absent file means
+/// defaults (no root configured).
 pub fn resolve_layout(
     env_home: Option<PathBuf>,
-    env_root: Option<PathBuf>,
     platform_home: PathBuf,
 ) -> Result<Layout, StoreError> {
-    let home = env_home.unwrap_or(platform_home);
-    let config = read_config(&home)?;
-    let root = env_root
-        .or(config.root.clone())
-        .unwrap_or_else(|| home.join("worktrees"));
-    Ok(Layout { home, root, config })
+    let home = env_home.unwrap_or_else(|| platform_home.join(".agent-worktree"));
+    let config = read_config(&home, &platform_home)?;
+    Ok(Layout {
+        home,
+        root: config.root.clone(),
+        config,
+    })
 }
 
 /// Reads `<home>/config.toml`; an absent file yields default configuration.
-fn read_config(home: &Path) -> Result<Config, StoreError> {
+/// `platform_home` is the real user home a leading `~/` expands against.
+fn read_config(home: &Path, platform_home: &Path) -> Result<Config, StoreError> {
     let path = home.join("config.toml");
     match fs::read_to_string(&path) {
-        Ok(text) => parse_config(&text),
+        Ok(text) => parse_config(&text, platform_home),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(StoreError::new(
             StoreErrorCode::Io,
@@ -160,8 +167,25 @@ fn read_config(home: &Path) -> Result<Config, StoreError> {
     }
 }
 
-/// Parses `config.toml` text, rejecting any key this build does not know.
-fn parse_config(text: &str) -> Result<Config, StoreError> {
+/// Expands a leading `~` component against the platform home; any other path
+/// is returned unchanged, including `~other` spellings (which the absolute
+/// check then refuses).
+fn expand_tilde(path: PathBuf, platform_home: &Path) -> PathBuf {
+    let mut components = path.components();
+    if components
+        .next()
+        .is_some_and(|component| component.as_os_str() == std::ffi::OsStr::new("~"))
+    {
+        let mut expanded = platform_home.to_path_buf();
+        expanded.extend(components);
+        return expanded;
+    }
+    path
+}
+
+/// Parses `config.toml` text, rejecting any key this build does not know and
+/// any configured path that is not absolute after `~/` expansion.
+fn parse_config(text: &str, platform_home: &Path) -> Result<Config, StoreError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RawStorage {
@@ -182,13 +206,52 @@ fn parse_config(text: &str) -> Result<Config, StoreError> {
         let detail: String = e.to_string().chars().take(200).collect();
         StoreError::new(StoreErrorCode::InvalidConfig, detail)
     })?;
-    Ok(Config {
-        root: raw.storage.and_then(|storage| storage.root),
+    let config = Config {
+        root: raw
+            .storage
+            .and_then(|storage| storage.root)
+            .map(|root| expand_tilde(root, platform_home)),
         discovery_roots: raw
             .discovery
             .and_then(|discovery| discovery.roots)
-            .unwrap_or_default(),
-    })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|root| expand_tilde(root, platform_home))
+            .collect(),
+    };
+    if let Some(root) = &config.root
+        && !root.is_absolute()
+    {
+        return Err(StoreError::new(
+            StoreErrorCode::InvalidConfig,
+            format!(
+                "[storage] root must be absolute or start with ~/: {}",
+                root.display()
+                    .to_string()
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            ),
+        ));
+    }
+    if let Some(root) = config
+        .discovery_roots
+        .iter()
+        .find(|root| !root.is_absolute())
+    {
+        return Err(StoreError::new(
+            StoreErrorCode::InvalidConfig,
+            format!(
+                "[discovery] roots entries must be absolute or start with ~/: {}",
+                root.display()
+                    .to_string()
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            ),
+        ));
+    }
+    Ok(config)
 }
 
 /// Guard holding the per-repository advisory lock.
@@ -534,6 +597,20 @@ pub fn delete_record(
 /// Writes `bytes` to `path` atomically: temp file in the same directory, fsync,
 /// rename, fsync of the directory. A failed attempt removes the temp file.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_atomic(path, bytes, true)
+}
+
+/// Writes `bytes` to `path` atomically without the durability fsyncs.
+///
+/// For cache-like state — the notify hook's episode file — where a crash
+/// costs one repeated block, never a lost notification, and the write must
+/// stay inside the hook's deadline.
+pub(crate) fn atomic_write_unsynced(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_atomic(path, bytes, false)
+}
+
+/// Shared temp-file-then-rename writer; `durable` adds the two fsyncs.
+fn write_atomic(path: &Path, bytes: &[u8], durable: bool) -> Result<(), StoreError> {
     let dir = path.parent().ok_or_else(|| {
         StoreError::new(
             StoreErrorCode::Io,
@@ -553,8 +630,10 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> 
             .map_err(|e| StoreError::new(StoreErrorCode::Io, format!("create temp: {e}")))?;
         file.write_all(bytes)
             .map_err(|e| StoreError::new(StoreErrorCode::Io, format!("write temp: {e}")))?;
-        file.sync_all()
-            .map_err(|e| StoreError::new(StoreErrorCode::Io, format!("sync temp: {e}")))?;
+        if durable {
+            file.sync_all()
+                .map_err(|e| StoreError::new(StoreErrorCode::Io, format!("sync temp: {e}")))?;
+        }
         fs::rename(&temp, path).map_err(|e| {
             StoreError::new(
                 StoreErrorCode::Io,
@@ -566,7 +645,10 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> 
         let _ = fs::remove_file(&temp);
         return Err(e);
     }
-    sync_dir(dir)
+    if durable {
+        sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// Flushes a directory's metadata so a rename or unlink inside it is durable.
@@ -920,42 +1002,88 @@ mod tests {
     }
 
     #[test]
-    fn layout_precedence() {
+    fn layout_resolves_root_only_from_config() {
         let tmp = tempfile::tempdir().unwrap();
         let platform = tmp.path().join("platform-home");
         let env_home = tmp.path().join("env-home");
 
-        // No config anywhere: env home wins and the root defaults under it.
-        let layout = resolve_layout(Some(env_home.clone()), None, platform.clone()).unwrap();
+        // No config anywhere: no root at all, not a built-in default location.
+        let layout = resolve_layout(Some(env_home.clone()), platform.clone()).unwrap();
         assert_eq!(layout.home, env_home);
-        assert_eq!(layout.root, env_home.join("worktrees"));
+        assert_eq!(layout.root, None);
         assert_eq!(layout.config, Config::default());
+        // Without the env override the home is <platform>/.agent-worktree.
+        assert_eq!(
+            resolve_layout(None, platform.clone()).unwrap().home,
+            platform.join(".agent-worktree")
+        );
 
-        // config.toml supplies the root when no env override exists.
-        fs::create_dir_all(&platform).unwrap();
+        // config.toml supplies the root; without the env override it is read
+        // from <platform>/.agent-worktree.
+        let default_home = platform.join(".agent-worktree");
+        fs::create_dir_all(&default_home).unwrap();
         fs::write(
-            platform.join("config.toml"),
+            default_home.join("config.toml"),
             "[storage]\nroot = \"/cfg/root\"\n",
         )
         .unwrap();
-        let layout = resolve_layout(None, None, platform.clone()).unwrap();
-        assert_eq!(layout.root, PathBuf::from("/cfg/root"));
-
-        // The env root beats config.toml.
-        let layout =
-            resolve_layout(None, Some(PathBuf::from("/env/root")), platform.clone()).unwrap();
-        assert_eq!(layout.root, PathBuf::from("/env/root"));
+        let layout = resolve_layout(None, platform.clone()).unwrap();
+        assert_eq!(layout.home, default_home);
+        assert_eq!(layout.root, Some(PathBuf::from("/cfg/root")));
 
         // The env home beats the platform home even when it holds a config.
-        let layout = resolve_layout(Some(env_home.clone()), None, platform).unwrap();
+        let layout = resolve_layout(Some(env_home.clone()), platform).unwrap();
         assert_eq!(layout.home, env_home);
-        assert_eq!(layout.root, env_home.join("worktrees"));
+        assert_eq!(layout.root, None);
+    }
+
+    #[test]
+    fn layout_expands_tilde_in_root_and_discovery_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let platform = tmp.path().join("real-home");
+        fs::create_dir_all(&home).unwrap();
+        // The owner's exact config shape.
+        fs::write(
+            home.join("config.toml"),
+            "[storage]\nroot = \"~/projects/worktrees\"\n[discovery]\nroots = [\"~/projects\"]\n",
+        )
+        .unwrap();
+        let layout = resolve_layout(Some(home), platform.clone()).unwrap();
+        assert_eq!(
+            layout.root,
+            Some(platform.join("projects").join("worktrees"))
+        );
+        assert_eq!(
+            layout.config.discovery_roots,
+            vec![platform.join("projects")]
+        );
+    }
+
+    #[test]
+    fn layout_refuses_relative_configured_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        for text in [
+            "[storage]\nroot = \"wt\"\n",
+            "[storage]\nroot = \"~other/wt\"\n",
+            "[discovery]\nroots = [\"~/ok\", \"rel\"]\n",
+        ] {
+            fs::write(home.join("config.toml"), text).unwrap();
+            let code = resolve_layout(Some(home.clone()), PathBuf::from("/real"))
+                .unwrap_err()
+                .code;
+            assert_eq!(code, StoreErrorCode::InvalidConfig, "config {text}");
+        }
     }
 
     #[test]
     fn invalid_config_key_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
+        // Without AGENT_WORKTREE_HOME the home is <platform>/.agent-worktree.
+        let home = tmp.path().join(".agent-worktree");
+        fs::create_dir_all(&home).unwrap();
         for text in [
             "[storage]\nunknown = 1\n",
             "top_level = true\n",
@@ -963,7 +1091,7 @@ mod tests {
             "[storage\n",
         ] {
             fs::write(home.join("config.toml"), text).unwrap();
-            let code = resolve_layout(None, None, home.to_path_buf())
+            let code = resolve_layout(None, tmp.path().to_path_buf())
                 .unwrap_err()
                 .code;
             assert_eq!(code, StoreErrorCode::InvalidConfig, "config {text}");
@@ -1439,7 +1567,7 @@ mod tests {
         fs::write(scan.join("README"), b"plain file").unwrap();
         let layout = Layout {
             home: home.clone(),
-            root: home.join("worktrees"),
+            root: None,
             config: Config {
                 root: None,
                 discovery_roots: vec![scan.clone()],
@@ -1494,7 +1622,7 @@ mod tests {
         .unwrap();
         let layout = Layout {
             home,
-            root: PathBuf::new(),
+            root: None,
             config: Config {
                 root: None,
                 discovery_roots: vec![scan],

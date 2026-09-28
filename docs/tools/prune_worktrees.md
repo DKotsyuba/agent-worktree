@@ -24,10 +24,13 @@ or `COMMITTED … applied=true`, followed by one candidate path per row, a
 `Cursor:` line when more preview pages remain, and warnings. The preview is
 keyset-paginated over the stably sorted candidate paths — pruning has no
 narrower scope, so an oversized preview pages through instead of refusing and
-rows are never silently skipped. Apply ignores `cursor`/`limit` and prunes
-every candidate repository-wide, reporting the full count. A cursor from a
-different repository is refused with `cursor_scope_mismatch`. A rendering
-failure after an applied prune still emits a Rust-side `COMMITTED` receipt.
+rows are never silently skipped. Path bytes and the encoded cursor are charged
+against the page's row budget, so many long paths shrink the page below
+`limit` instead of overflowing the 8 KiB cap. Apply ignores `cursor`/`limit`
+and prunes every candidate repository-wide, reporting the full count. A cursor
+from a different repository is refused with `cursor_scope_mismatch`. A
+rendering failure after an applied prune still emits a Rust-side `COMMITTED`
+receipt.
 
 ## Refusals (`ERROR …`)
 

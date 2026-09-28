@@ -73,16 +73,21 @@ notification per 24 h-idle worktree, see
 
 ## Configuration
 
-- Product home: `~/.agent-worktree/` by default, override with
-  `AGENT_WORKTREE_HOME`. Contains `config.toml`, `worktrees/` and `state/`.
-- Worktree root: `<home>/worktrees` by default. Precedence:
-  `AGENT_WORKTREE_ROOT` > `config.toml` `[storage] root` > default.
-  Changing the root affects future creation only.
-- `config.toml` (at `<home>/config.toml`) accepts exactly two keys; unknown
-  keys are rejected with `invalid_config`:
-  - `[storage] root` — path overriding the worktree root.
+- Product home: `~/.agent-worktree/` by default, moved wholesale with
+  `AGENT_WORKTREE_HOME`. Contains `config.toml` and `state/`.
+- Worktree root: configured ONLY in `config.toml`
+  (`[storage] root = "~/projects/worktrees"`); there is no default location
+  and no environment override. `create_worktree` refuses
+  `root_not_configured` until one is set; everything else works without a
+  root. Changing the root affects future creation only.
+- `config.toml` (at `~/.agent-worktree/config.toml`) accepts exactly two
+  keys; unknown keys are rejected with `invalid_config`:
+  - `[storage] root` — the worktree root. A leading `~/` expands to the real
+    home; otherwise the path must be absolute.
   - `[discovery] roots` — list of paths scanned (depth ≤ 2) for repository
-    discovery when listing across repositories.
+    discovery when listing across repositories. Same `~/` rule.
+- `agent-worktree doctor` prints the home, config path, resolved root (or
+  `not configured`) and discovery roots.
 
 ## Development
 

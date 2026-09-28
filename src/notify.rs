@@ -11,7 +11,7 @@
 //! `<home>/logs/hook.log` instead), and finishes within a 3 s total deadline.
 //! Scans are rate-limited to one per 10 minutes.
 
-use crate::service::{IdleRow, Service};
+use crate::service::{IdleRow, IdleScan, Service};
 use crate::store;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -124,20 +124,22 @@ async fn scan(start: Instant, host: &str) -> String {
         log_error(Some(&home), host, "policy_invalid");
         return String::new();
     };
-    let Some(rows) = service.idle_worktrees(start + SCAN_MARGIN).await else {
+    let Some(scan) = service.idle_worktrees(start + SCAN_MARGIN).await else {
         // Incomplete pass (deadline or scope failure): no state change at all,
         // so neither the rate limit nor the episode set is stamped by a scan
         // that saw only part of the scope; the next prompt rescans.
         return String::new();
     };
-    let episodes = episodes_from(&rows);
+    let episodes = episodes_from(&scan.rows);
     let fresh = new_episodes(&state.episodes, &episodes);
     // Record first: an episode that cannot be recorded must not be announced,
     // or it would repeat on every prompt once the state becomes writable.
+    // Recorded episodes are never dropped on transient evidence — see
+    // [`retained_episodes`].
     let next = NotifyState {
         schema_version: NOTIFY_SCHEMA_VERSION,
         last_scan_at: now,
-        episodes,
+        episodes: retained_episodes(&state.episodes, &episodes, &scan),
     };
     if let Err(error) = write_state(&home, &next) {
         log_error(Some(&home), host, &format!("write_state: {error}"));
@@ -146,7 +148,8 @@ async fn scan(start: Instant, host: &str) -> String {
     if fresh.is_empty() {
         return String::new();
     }
-    let fresh_rows: Vec<IdleRow> = rows
+    let fresh_rows: Vec<IdleRow> = scan
+        .rows
         .iter()
         .filter(|row| fresh.iter().any(|e| e.path == canonical(&row.path)))
         .cloned()
@@ -167,7 +170,7 @@ fn home_dir() -> Option<PathBuf> {
     let platform_home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
-    store::resolve_layout(env_home, None, platform_home)
+    store::resolve_layout(env_home, platform_home)
         .ok()
         .map(|layout| layout.home)
 }
@@ -188,10 +191,15 @@ fn read_state(home: &Path) -> NotifyState {
     }
 }
 
-/// Atomically writes the notification state.
+/// Atomically writes the notification state without fsync.
+///
+/// The file is a dedupe cache: losing it to a crash costs one repeated block,
+/// never a lost notification, so the durability syncs are skipped and the
+/// whole tail (serialize, temp write, rename) stays microseconds inside the
+/// 3 s hook deadline instead of blocking past it on a slow disk.
 fn write_state(home: &Path, state: &NotifyState) -> Result<(), String> {
     let bytes = serde_json::to_vec(state).map_err(|e| e.to_string())?;
-    store::atomic_write(&state_path(home), &bytes).map_err(|e| e.to_string())
+    store::atomic_write_unsynced(&state_path(home), &bytes).map_err(|e| e.to_string())
 }
 
 /// State file path `<home>/state/v1/notify.json`.
@@ -200,6 +208,10 @@ fn state_path(home: &Path) -> PathBuf {
 }
 
 /// Acquires the exclusive notification lock, or `None` within [`LOCK_WAIT`].
+///
+/// Contention (`WouldBlock`) is expected and stays silent; any other lock
+/// failure — a real filesystem error, not a busy peer — is logged so a broken
+/// setup is attributable in `hook.log`.
 fn try_lock(home: &Path) -> Option<File> {
     use fs2::FileExt;
     let path = home.join("state/v1/notify.lock");
@@ -213,8 +225,16 @@ fn try_lock(home: &Path) -> Option<File> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Some(file),
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                log_error(Some(home), "", &format!("notify_lock_failed: {error}"));
+                return None;
+            }
         }
     }
 }
@@ -255,6 +275,41 @@ fn new_episodes(known: &[Episode], idle: &[Episode]) -> Vec<Episode> {
         .filter(|episode| !known.contains(episode))
         .cloned()
         .collect()
+}
+
+/// Merges recorded episodes into a completed scan's fresh idle set.
+///
+/// A recorded episode is dropped only on positive evidence: this scan saw a
+/// newer activity timestamp on the same path (the episode is over and its
+/// timestamp can never recur), or every repository was inventoried and none
+/// lists the registration any more (the worktree is gone). Anything weaker —
+/// a failed inventory ([`IdleScan::incomplete`]), a failed observation, a
+/// missing signal — is "unknown, keep": the entry survives so the next scan
+/// cannot re-announce it.
+fn retained_episodes(known: &[Episode], idle: &[Episode], scan: &IdleScan) -> Vec<Episode> {
+    let mut merged = idle.to_vec();
+    for episode in known {
+        if idle.iter().any(|fresh| fresh.path == episode.path) {
+            // This scan's episode for the same path supersedes the record.
+            continue;
+        }
+        if scan
+            .activity
+            .get(&episode.path)
+            .is_some_and(|at| *at > episode.last_activity)
+        {
+            // Activity moved past the recorded timestamp: episode over.
+            continue;
+        }
+        if !scan.incomplete && !scan.registered.contains(&episode.path) {
+            // Every repository inventoried, none lists it: gone.
+            continue;
+        }
+        merged.push(episode.clone());
+    }
+    merged.sort_by(|a, b| (&a.path, a.last_activity).cmp(&(&b.path, b.last_activity)));
+    merged.dedup();
+    merged
 }
 
 /// Renders the bounded `<agent-worktree>` block for the new idle `rows`.
@@ -385,6 +440,42 @@ mod tests {
         assert!(rate_limited(now, now));
         // A future stamp is expired, not eternally fresh.
         assert!(!rate_limited(now + 60, now));
+    }
+
+    /// A scan that saw nothing of one repo (failed inventory, failed observe
+    /// or missing signals) keeps every recorded episode.
+    fn empty_scan() -> IdleScan {
+        IdleScan::default()
+    }
+
+    #[test]
+    fn recorded_episodes_survive_incomplete_scans() {
+        let known = vec![episode("task-1", 100)];
+        // Complete pass, registration absent everywhere: gone, dropped.
+        let mut scan = empty_scan();
+        scan.incomplete = false;
+        assert!(retained_episodes(&known, &[], &scan).is_empty());
+        // One repo failed: unknown, keep.
+        let mut scan = empty_scan();
+        scan.incomplete = true;
+        assert_eq!(retained_episodes(&known, &[], &scan), known);
+        // Registration still listed: the worktree exists, keep.
+        let mut scan = empty_scan();
+        scan.registered.insert(PathBuf::from("/wt/task-1"));
+        assert_eq!(retained_episodes(&known, &[], &scan), known);
+    }
+
+    #[test]
+    fn newer_activity_closes_and_replaces_an_episode() {
+        let known = vec![episode("task-1", 100)];
+        // Observed activity moved: the recorded episode is over, dropped.
+        let mut scan = empty_scan();
+        scan.activity.insert(PathBuf::from("/wt/task-1"), 500);
+        assert!(retained_episodes(&known, &[], &scan).is_empty());
+        // A fresh idle episode for the same path supersedes the record.
+        let scan = empty_scan();
+        let fresh = vec![episode("task-1", 900)];
+        assert_eq!(retained_episodes(&known, &fresh, &scan), fresh);
     }
 
     #[test]

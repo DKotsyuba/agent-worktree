@@ -70,7 +70,9 @@ instead of being rate-limited by a partial answer.
 ## State file and episode rule
 
 State lives in `<home>/state/v1/notify.json`, guarded by an advisory
-exclusive lock at `<home>/state/v1/notify.lock` and written atomically:
+exclusive lock at `<home>/state/v1/notify.lock` and written atomically
+(without fsync — the file is a dedupe cache, and losing it to a crash costs
+one repeated block, never a lost notification):
 
 ```json
 {"schema_version":1,"last_scan_at":1790000000,
@@ -79,10 +81,15 @@ exclusive lock at `<home>/state/v1/notify.lock` and written atomically:
 
 An **episode** is the pair (canonical worktree path, last-activity
 timestamp). Only episodes not yet recorded in the state file are announced;
-the scan then rewrites the file with the currently idle set, which also
-drops entries for worktrees that no longer exist (or are no longer idle).
-If a worktree becomes active and later idle again, its timestamp moved, so
-that is a new episode and it notifies again — once.
+the scan then rewrites the file with the currently idle set merged with the
+recorded set. A recorded episode is dropped only on positive evidence: the
+same path now has a newer activity timestamp (that episode is over and can
+never recur), or every repository was successfully inventoried and none lists
+the registration any more (the worktree is gone). A repository whose
+inventory failed, a worktree whose observation failed, or a missing signal is
+"unknown, keep" — the entry survives, so a later scan cannot re-announce the
+same episode. If a worktree becomes active and later idle again, its
+timestamp moved, so that is a new episode and it notifies again — once.
 
 ## Hook entries
 

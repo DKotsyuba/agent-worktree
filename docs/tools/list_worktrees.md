@@ -56,6 +56,8 @@ checkout is never one. The whole call shares one deadline; repositories not
 reached are named in `Coverage:` as `deadline_exceeded`, a per-repo directory
 that could not be read is named as `orphan_scan_failed` (so `orphan=0` is
 never shown for an unread directory), and a truncated orphan scan is flagged.
+With no configured `[storage] root` the per-repo orphan scan is skipped and
+`Coverage:` says `worktree root not configured; orphan scan skipped`.
 The encoded cursor is charged against the same row budget: a page whose
 cursor would overflow the 8 KiB cap is shrunk (or refused for a single
 oversized row) instead of falling back. A
@@ -67,4 +69,4 @@ is safe under keyset order.
 
 - `invalid_arguments`, `limit_out_of_range`, `cursor_invalid`,
   `cursor_scope_mismatch`, `repo_path_invalid`, `not_a_repository`,
-  `root_not_absolute` (relative `AGENT_WORKTREE_ROOT` or `[storage] root`).
+  `invalid_config` (relative `[storage] root` or `[discovery] roots` entry).

@@ -185,12 +185,23 @@ mod tests {
 
     #[tokio::test]
     async fn valid_arguments_reach_the_service() {
-        // A nonexistent repository path is refused by Git, proving the call
-        // reaches the real Git contract end to end.
+        // The refusal depends on the environment's configured root: with a
+        // root the call proceeds to Git and is refused by it; without one it
+        // is refused by the root check. Either way the typed ERROR proves the
+        // call passed argument validation and reached the service.
+        let env_home = std::env::var_os("AGENT_WORKTREE_HOME").map(std::path::PathBuf::from);
+        let platform_home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let expected = match crate::store::resolve_layout(env_home, platform_home) {
+            Ok(layout) if layout.root.is_some() => "ERROR not_a_repository:",
+            Ok(_) => "ERROR root_not_configured:",
+            Err(_) => "ERROR invalid_config:",
+        };
         let result = call(base_args(), &templates(), &Service::new().unwrap()).await;
         assert_eq!(result.is_error, Some(true));
         let text = crate::response::first_text(&result);
-        assert!(text.starts_with("ERROR not_a_repository:"), "{text}");
+        assert!(text.starts_with(expected), "{text}");
     }
 
     #[test]
