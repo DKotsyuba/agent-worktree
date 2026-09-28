@@ -9,6 +9,8 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace path dependencies carry no version; allowed only because every crate is publish = false.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
