@@ -3,22 +3,16 @@ mod response;
 mod service;
 mod tools;
 // Frozen shared contracts for parallel module work. Each dead-code allowance is
-// removed when its owning module is implemented.
+// removed when its owning module is implemented. The Git module is implemented,
+// but nothing calls it until the service wiring lands; the allowance below dies
+// with the first src/service.rs call site.
 #[allow(
     dead_code,
-    reason = "Frozen git.rs contract; removed when the Git module is implemented"
+    reason = "Implemented git.rs, not yet reachable from main; remove with service wiring"
 )]
 mod git;
-#[allow(
-    dead_code,
-    reason = "Frozen store.rs contract; removed when the state module is implemented"
-)]
-mod store;
-#[allow(
-    dead_code,
-    reason = "Frozen worktree.rs contract; removed when the policy module is implemented"
-)]
-mod worktree;
+pub mod store;
+pub mod worktree;
 use clap::{Parser, Subcommand};
 use mcp_presentation::Renderer;
 use rmcp::{
