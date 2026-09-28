@@ -2,9 +2,8 @@
 //!
 //! This module owns the data shapes exchanged between Git access (`crate::git`),
 //! persistent state (`crate::store`) and the MCP tools. Everything here is pure:
-//! no filesystem, subprocess or clock access. The decision functions are frozen
-//! substitutes that answer in the conservative direction until the owning module
-//! implements them.
+//! no filesystem, subprocess or clock access. `classify` and `assess_removal`
+//! answer conservatively: an unknown probe is never treated as a clean result.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -615,35 +614,222 @@ pub struct Budget {
 /// (claiming activity longer is the conservative direction). Missing signals
 /// yield `Unknown`.
 ///
-/// Substitute body: always returns `Activity::Unknown` with no warnings.
+/// Warnings never block: size at or above the policy threshold (a lower bound
+/// counts), unmerged or undeterminable integration, and one `ProbeIncomplete`
+/// per probe that ran partially. The record is not an input here, so this
+/// function cannot emit `Warning::RemovalStarted`; the caller holding the
+/// record must add that warning itself when `removal_started` is set.
 #[must_use]
-pub fn classify(_observation: &Observation, _policy: &Policy, _now: u64) -> Advice {
-    // Substitute: never claims knowledge of activity or risk.
-    Advice {
-        activity: Activity::Unknown,
-        warnings: Vec::new(),
-    }
+pub fn classify(observation: &Observation, policy: &Policy, now: u64) -> Advice {
+    let mut warnings = Vec::new();
+    collect_warnings(observation, policy, &mut warnings);
+    let activity = if probe_value(&observation.live_processes).copied() == Some(true) {
+        Activity::Active
+    } else {
+        match newest_signal(observation) {
+            None => Activity::Unknown,
+            Some(newest) => {
+                let age = now.saturating_sub(newest);
+                if age >= policy.stale_after_secs {
+                    Activity::StaleCandidate
+                } else if age >= policy.idle_after_secs {
+                    Activity::IdleCandidate
+                } else {
+                    Activity::Recent
+                }
+            }
+        }
+    };
+    Advice { activity, warnings }
 }
 
 /// Assesses a removal request against the observation, record and policy.
 ///
-/// Returns every blocking veto and every warning; the fingerprint is present
-/// when the probes required to compute it were known.
-///
-/// Substitute body: always refuses with `Veto::NotImplemented`.
+/// Returns every blocking veto and every warning; empty vetoes mean removal
+/// may proceed. An unknown, unavailable or incomplete required probe is never
+/// treated as clean: it adds `Veto::ProbeUnknown`. The current fingerprint is
+/// always computed from the best available status evidence and returned when
+/// the status probe produced a digest; `expected_fingerprint` is compared
+/// against it only when both exist.
 #[must_use]
 pub fn assess_removal(
-    _observation: &Observation,
-    _record: Option<&Record>,
-    _request: &RemovalRequest,
-    _policy: &Policy,
+    observation: &Observation,
+    record: Option<&Record>,
+    request: &RemovalRequest,
+    policy: &Policy,
 ) -> Decision {
-    // Substitute: removal is always refused until the policy module lands.
-    Decision {
-        vetoes: vec![Veto::NotImplemented],
-        warnings: Vec::new(),
-        fingerprint: None,
+    let mut vetoes = Vec::new();
+    let mut warnings = Vec::new();
+    collect_warnings(observation, policy, &mut warnings);
+    if record.is_some_and(|r| r.removal_started.is_some()) {
+        warnings.push(Warning::RemovalStarted);
     }
+
+    let registration = &observation.registration;
+    if registration.is_main {
+        vetoes.push(Veto::MainWorktree);
+    }
+    if registration.bare {
+        vetoes.push(Veto::BareRepository);
+    }
+    if registration.locked.is_some() {
+        vetoes.push(Veto::GitLocked);
+    }
+
+    if let Some(facts) = probe_value(&observation.status) {
+        if facts.staged > 0 || facts.unstaged > 0 {
+            vetoes.push(Veto::Dirty);
+        }
+        if facts.untracked > 0 {
+            vetoes.push(Veto::UntrackedFiles);
+        }
+        if facts.conflicts > 0 {
+            vetoes.push(Veto::Conflicts);
+        }
+        let not_disposable: Vec<String> = facts
+            .ignored
+            .iter()
+            .filter(|path| !is_disposable(path, &request.disposable_paths))
+            .cloned()
+            .collect();
+        if !not_disposable.is_empty() {
+            vetoes.push(Veto::IgnoredNotDisposable {
+                paths: not_disposable,
+            });
+        }
+    }
+
+    if let Some(submodules) = probe_value(&observation.submodules)
+        && (submodules.dirty || submodules.unsupported)
+    {
+        vetoes.push(Veto::DirtySubmodules);
+    }
+
+    if probe_value(&observation.live_processes).copied() == Some(true) {
+        vetoes.push(Veto::LiveProcess);
+    }
+
+    // Status, processes and submodules are always required; integration is
+    // required to prove mergedness unless the request explicitly waives it.
+    let mut probe_unknown = !is_known(&observation.status)
+        || !is_known(&observation.live_processes)
+        || !is_known(&observation.submodules);
+    if !request.allow_unmerged {
+        probe_unknown = probe_unknown || !is_known(&observation.integration);
+    }
+    if probe_unknown {
+        vetoes.push(Veto::ProbeUnknown);
+    }
+
+    if !request.allow_unmerged
+        && probe_value(&observation.integration).copied() == Some(Integration::Unmerged)
+    {
+        vetoes.push(Veto::Unmerged);
+    }
+
+    let current = probe_value(&observation.status).map(|facts| {
+        fingerprint(&FingerprintInput {
+            path: &registration.path,
+            head: registration.head.as_deref().unwrap_or(""),
+            branch: registration.branch.as_deref().unwrap_or(""),
+            status_digest: &facts.digest,
+            disposable_paths: &request.disposable_paths,
+            record_revision: record.map_or(0, |r| r.revision),
+            policy_revision: policy.revision,
+        })
+    });
+    if let (Some(expected), Some(actual)) = (&request.expected_fingerprint, &current)
+        && expected != actual
+    {
+        vetoes.push(Veto::FingerprintMismatch);
+    }
+
+    Decision {
+        vetoes,
+        warnings,
+        fingerprint: current,
+    }
+}
+
+/// Newest of the cheap activity timestamps; `None` when every signal is absent.
+fn newest_signal(observation: &Observation) -> Option<u64> {
+    let signals = &observation.activity_signals;
+    [
+        signals.head_mtime,
+        signals.index_mtime,
+        signals.last_reflog_entry,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// Guaranteed value of a probe: the payload of `Known` or the evidence of
+/// `Incomplete`; `None` for `NotChecked` and `Unavailable`.
+fn probe_value<T>(probe: &Probe<T>) -> Option<&T> {
+    match probe {
+        Probe::Known(value)
+        | Probe::Incomplete {
+            evidence: value, ..
+        } => Some(value),
+        Probe::NotChecked | Probe::Unavailable { .. } => None,
+    }
+}
+
+/// Reason text when a probe ran partially; `None` when it did not.
+fn incomplete_reason<T>(probe: &Probe<T>) -> Option<&str> {
+    match probe {
+        Probe::Incomplete { reason, .. } => Some(reason),
+        Probe::Known(_) | Probe::NotChecked | Probe::Unavailable { .. } => None,
+    }
+}
+
+/// True only when the probe completed fully; partial evidence is not certainty.
+fn is_known<T>(probe: &Probe<T>) -> bool {
+    matches!(probe, Probe::Known(_))
+}
+
+/// Collects the non-blocking warnings shared by advice and removal decisions.
+fn collect_warnings(observation: &Observation, policy: &Policy, warnings: &mut Vec<Warning>) {
+    if let Some(size) = probe_value(&observation.size)
+        && size.bytes >= policy.size_warning_bytes
+    {
+        warnings.push(Warning::SizeAtLeast { bytes: size.bytes });
+    }
+    match probe_value(&observation.integration).copied() {
+        Some(Integration::Unmerged) => warnings.push(Warning::Unmerged),
+        Some(Integration::AncestorMerged) => {}
+        Some(Integration::Unknown) | None => warnings.push(Warning::IntegrationUnknown),
+    }
+    let reasons = [
+        incomplete_reason(&observation.live_processes),
+        incomplete_reason(&observation.status),
+        incomplete_reason(&observation.submodules),
+        incomplete_reason(&observation.integration),
+        incomplete_reason(&observation.size),
+    ];
+    for reason in reasons.into_iter().flatten() {
+        warnings.push(Warning::ProbeIncomplete {
+            reason: reason.to_owned(),
+        });
+    }
+}
+
+/// True when `ignored` falls under an approved disposable path.
+///
+/// Coverage is a prefix match on path components: `target` covers
+/// `target/debug` and `target/` but not `targetx`. Entries that are empty,
+/// dot-only or absolute approve nothing, because `disposable_paths` are
+/// worktree-relative and an over-broad entry must never silently approve
+/// ignored work.
+fn is_disposable(ignored: &str, disposable: &[PathBuf]) -> bool {
+    let ignored = Path::new(ignored);
+    disposable.iter().any(|approved| {
+        matches!(
+            approved.components().next(),
+            Some(std::path::Component::Normal(_))
+        ) && ignored.strip_prefix(approved).is_ok()
+    })
 }
 
 /// Lowercase hex encoding of a byte slice.
@@ -766,23 +952,581 @@ mod tests {
         }
     }
 
-    #[test]
-    fn substitute_classify_reports_unknown() {
-        let advice = classify(&sample_observation(), &Policy::default(), 2_000);
-        assert_eq!(advice.activity, Activity::Unknown);
-        assert!(advice.warnings.is_empty());
+    /// Fully known, clean observation: the baseline every table row tweaks.
+    fn clean_observation() -> Observation {
+        Observation {
+            live_processes: Probe::Known(false),
+            status: Probe::Known(StatusFacts {
+                staged: 0,
+                unstaged: 0,
+                untracked: 0,
+                conflicts: 0,
+                ignored: Vec::new(),
+                digest: "cafe01".to_owned(),
+            }),
+            submodules: Probe::Known(SubmoduleFacts {
+                dirty: false,
+                unsupported: false,
+            }),
+            integration: Probe::Known(Integration::AncestorMerged),
+            size: Probe::NotChecked,
+            ..sample_observation()
+        }
+    }
+
+    /// Clones a base observation and applies one tweak.
+    fn with(base: &Observation, tweak: impl FnOnce(&mut Observation)) -> Observation {
+        let mut observation = base.clone();
+        tweak(&mut observation);
+        observation
+    }
+
+    /// Tweaks the facts of a known status probe; panics outside tests.
+    fn with_status(base: &Observation, tweak: impl FnOnce(&mut StatusFacts)) -> Observation {
+        with(base, |observation| {
+            if let Probe::Known(facts) = &mut observation.status {
+                tweak(facts);
+            }
+        })
+    }
+
+    /// A stored record for the sample worktree at revision 3.
+    fn sample_record() -> Record {
+        Record {
+            schema_version: RECORD_SCHEMA_VERSION,
+            repo_id: RepoId::from_common_dir(Path::new("/repo/.git"))
+                .as_str()
+                .to_owned(),
+            name: "task-1".to_owned(),
+            path: PathBuf::from("/w/task-1"),
+            branch: Some("refs/heads/aw/task-1".to_owned()),
+            base_ref: None,
+            base_oid: None,
+            created_at: 500,
+            creator: "harness".to_owned(),
+            revision: 3,
+            removal_started: None,
+        }
+    }
+
+    /// The fingerprint `assess_removal` should compute for this setup.
+    fn expected_fingerprint(
+        observation: &Observation,
+        record: Option<&Record>,
+        request: &RemovalRequest,
+        digest: &str,
+    ) -> Fingerprint {
+        fingerprint(&FingerprintInput {
+            path: &observation.registration.path,
+            head: observation.registration.head.as_deref().unwrap_or(""),
+            branch: observation.registration.branch.as_deref().unwrap_or(""),
+            status_digest: digest,
+            disposable_paths: &request.disposable_paths,
+            record_revision: record.map_or(0, |r| r.revision),
+            policy_revision: Policy::default().revision,
+        })
     }
 
     #[test]
-    fn substitute_assessment_always_vetoes() {
-        let decision = assess_removal(
-            &sample_observation(),
-            None,
-            &RemovalRequest::default(),
-            &Policy::default(),
+    fn classify_activity_bands() {
+        let now = 10_000_000_u64;
+        let hour = 3_600_u64;
+        let day = 24 * hour;
+        let signals =
+            |head: Option<u64>, index: Option<u64>, reflog: Option<u64>| ActivitySignals {
+                head_mtime: head,
+                index_mtime: index,
+                last_reflog_entry: reflog,
+            };
+        let cases = [
+            (
+                "live process wins",
+                Probe::Known(true),
+                signals(None, None, None),
+                Activity::Active,
+            ),
+            (
+                "fresh signal",
+                Probe::Known(false),
+                signals(Some(now - hour), None, None),
+                Activity::Recent,
+            ),
+            (
+                "recent boundary",
+                Probe::Known(false),
+                signals(None, Some(now - 86_399), None),
+                Activity::Recent,
+            ),
+            (
+                "between recent and idle stays recent",
+                Probe::Known(false),
+                signals(Some(now - 25 * hour), None, None),
+                Activity::Recent,
+            ),
+            (
+                "newest signal decides",
+                Probe::Known(false),
+                signals(Some(now - 31 * day), Some(now - hour), Some(now - 8 * day)),
+                Activity::Recent,
+            ),
+            (
+                "idle boundary",
+                Probe::Known(false),
+                signals(None, None, Some(now - 7 * day)),
+                Activity::IdleCandidate,
+            ),
+            (
+                "stale boundary",
+                Probe::Known(false),
+                signals(Some(now - 30 * day), None, None),
+                Activity::StaleCandidate,
+            ),
+            (
+                "no signals is unknown",
+                Probe::Known(false),
+                signals(None, None, None),
+                Activity::Unknown,
+            ),
+            (
+                "unchecked process probe does not fake knowledge",
+                Probe::NotChecked,
+                signals(None, None, None),
+                Activity::Unknown,
+            ),
+        ];
+        for (name, live, signals, expected) in cases {
+            let observation = with(&clean_observation(), |o| {
+                o.live_processes = live;
+                o.activity_signals = signals;
+            });
+            assert_eq!(
+                classify(&observation, &Policy::default(), now).activity,
+                expected,
+                "case {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_warnings() {
+        let policy = Policy {
+            size_warning_bytes: 100,
+            ..Policy::default()
+        };
+        let size_of = |bytes: u64, quality: SizeQuality| {
+            with(&clean_observation(), |o| {
+                o.size = Probe::Known(Size { bytes, quality })
+            })
+        };
+        let warns_at_least = |observation: &Observation| {
+            classify(observation, &policy, 0)
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::SizeAtLeast { bytes } if *bytes >= 100))
+        };
+        assert!(warns_at_least(&size_of(100, SizeQuality::Complete)));
+        // A lower bound at or above the threshold also warns.
+        assert!(warns_at_least(&size_of(150, SizeQuality::LowerBound)));
+        assert!(!warns_at_least(&size_of(99, SizeQuality::Complete)));
+
+        let unmerged = with(&clean_observation(), |o| {
+            o.integration = Probe::Known(Integration::Unmerged)
+        });
+        assert!(
+            classify(&unmerged, &policy, 0)
+                .warnings
+                .contains(&Warning::Unmerged)
         );
-        assert_eq!(decision.vetoes, vec![Veto::NotImplemented]);
-        assert_eq!(decision.vetoes[0].code(), "not_implemented");
-        assert!(decision.fingerprint.is_none());
+        let unchecked = with(&clean_observation(), |o| o.integration = Probe::NotChecked);
+        assert!(
+            classify(&unchecked, &policy, 0)
+                .warnings
+                .contains(&Warning::IntegrationUnknown)
+        );
+        let unknown_integration = with(&clean_observation(), |o| {
+            o.integration = Probe::Known(Integration::Unknown)
+        });
+        assert!(
+            classify(&unknown_integration, &policy, 0)
+                .warnings
+                .contains(&Warning::IntegrationUnknown)
+        );
+
+        let incomplete = with(&clean_observation(), |o| {
+            o.status = Probe::Incomplete {
+                evidence: StatusFacts {
+                    staged: 0,
+                    unstaged: 0,
+                    untracked: 0,
+                    conflicts: 0,
+                    ignored: Vec::new(),
+                    digest: "cafe01".to_owned(),
+                },
+                reason: "output cap hit".to_owned(),
+            }
+        });
+        assert!(
+            classify(&incomplete, &policy, 0)
+                .warnings
+                .contains(&Warning::ProbeIncomplete {
+                    reason: "output cap hit".to_owned()
+                })
+        );
+    }
+
+    #[test]
+    fn assess_removal_table() {
+        let policy = Policy::default();
+        let clean = clean_observation();
+        let record = sample_record();
+        let unmerged_observation = with(&clean, |o| {
+            o.integration = Probe::Known(Integration::Unmerged)
+        });
+        let covered_request = RemovalRequest {
+            disposable_paths: vec![PathBuf::from("target")],
+            ..RemovalRequest::default()
+        };
+        // One veto table row: case name, observation, stored record, request,
+        // and the exact veto list expected.
+        type VetoRow = (
+            &'static str,
+            Observation,
+            Option<Record>,
+            RemovalRequest,
+            Vec<Veto>,
+        );
+        let cases: Vec<VetoRow> = vec![
+            (
+                "main worktree",
+                with(&clean, |o| o.registration.is_main = true),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::MainWorktree],
+            ),
+            (
+                "bare repository",
+                with(&clean, |o| o.registration.bare = true),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::BareRepository],
+            ),
+            (
+                "git locked",
+                with(&clean, |o| {
+                    o.registration.locked = Some("pinned".to_owned())
+                }),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::GitLocked],
+            ),
+            (
+                "staged changes",
+                with_status(&clean, |f| f.staged = 1),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::Dirty],
+            ),
+            (
+                "unstaged changes",
+                with_status(&clean, |f| f.unstaged = 1),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::Dirty],
+            ),
+            (
+                "untracked files",
+                with_status(&clean, |f| f.untracked = 2),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::UntrackedFiles],
+            ),
+            (
+                "conflicts",
+                with_status(&clean, |f| f.conflicts = 1),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::Conflicts],
+            ),
+            (
+                "dirty submodules",
+                with(&clean, |o| {
+                    o.submodules = Probe::Known(SubmoduleFacts {
+                        dirty: true,
+                        unsupported: false,
+                    })
+                }),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::DirtySubmodules],
+            ),
+            (
+                "unsupported submodules",
+                with(&clean, |o| {
+                    o.submodules = Probe::Known(SubmoduleFacts {
+                        dirty: false,
+                        unsupported: true,
+                    })
+                }),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::DirtySubmodules],
+            ),
+            (
+                "ignored outside disposable paths",
+                with_status(&clean, |f| f.ignored = vec!["build/".to_owned()]),
+                None,
+                covered_request.clone(),
+                vec![Veto::IgnoredNotDisposable {
+                    paths: vec!["build/".to_owned()],
+                }],
+            ),
+            (
+                "ignored covered by component prefix",
+                with_status(&clean, |f| f.ignored = vec!["target/debug/log".to_owned()]),
+                None,
+                covered_request.clone(),
+                Vec::new(),
+            ),
+            (
+                "string prefix is not component coverage",
+                with_status(&clean, |f| f.ignored = vec!["targetx".to_owned()]),
+                None,
+                covered_request.clone(),
+                vec![Veto::IgnoredNotDisposable {
+                    paths: vec!["targetx".to_owned()],
+                }],
+            ),
+            (
+                "live process",
+                with(&clean, |o| o.live_processes = Probe::Known(true)),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::LiveProcess],
+            ),
+            (
+                "incomplete process evidence still vetoes",
+                with(&clean, |o| {
+                    o.live_processes = Probe::Incomplete {
+                        evidence: true,
+                        reason: "lsof denied".to_owned(),
+                    }
+                }),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::LiveProcess, Veto::ProbeUnknown],
+            ),
+            (
+                "status not checked",
+                with(&clean, |o| o.status = Probe::NotChecked),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::ProbeUnknown],
+            ),
+            (
+                "status unavailable",
+                with(&clean, |o| {
+                    o.status = Probe::Unavailable {
+                        code: "timeout".to_owned(),
+                    }
+                }),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::ProbeUnknown],
+            ),
+            (
+                "status incomplete",
+                with(&clean, |o| {
+                    o.status = Probe::Incomplete {
+                        evidence: StatusFacts {
+                            staged: 0,
+                            unstaged: 0,
+                            untracked: 0,
+                            conflicts: 0,
+                            ignored: Vec::new(),
+                            digest: "cafe01".to_owned(),
+                        },
+                        reason: "output cap hit".to_owned(),
+                    }
+                }),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::ProbeUnknown],
+            ),
+            (
+                "submodules not checked",
+                with(&clean, |o| o.submodules = Probe::NotChecked),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::ProbeUnknown],
+            ),
+            (
+                "integration not checked",
+                with(&clean, |o| o.integration = Probe::NotChecked),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::ProbeUnknown],
+            ),
+            (
+                "integration unavailable",
+                with(&clean, |o| {
+                    o.integration = Probe::Unavailable {
+                        code: "no-ref".to_owned(),
+                    }
+                }),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::ProbeUnknown],
+            ),
+            (
+                "unmerged without confirmation",
+                unmerged_observation.clone(),
+                None,
+                RemovalRequest::default(),
+                vec![Veto::Unmerged],
+            ),
+            (
+                "unmerged with explicit confirmation",
+                unmerged_observation.clone(),
+                None,
+                RemovalRequest {
+                    allow_unmerged: true,
+                    ..RemovalRequest::default()
+                },
+                Vec::new(),
+            ),
+            (
+                "fingerprint mismatch",
+                clean.clone(),
+                None,
+                RemovalRequest {
+                    expected_fingerprint: Some(expected_fingerprint(
+                        &clean,
+                        None,
+                        &RemovalRequest::default(),
+                        "tampered",
+                    )),
+                    ..RemovalRequest::default()
+                },
+                vec![Veto::FingerprintMismatch],
+            ),
+            (
+                "fingerprint match",
+                clean.clone(),
+                None,
+                RemovalRequest {
+                    expected_fingerprint: Some(expected_fingerprint(
+                        &clean,
+                        None,
+                        &RemovalRequest::default(),
+                        "cafe01",
+                    )),
+                    ..RemovalRequest::default()
+                },
+                Vec::new(),
+            ),
+            (
+                "fingerprint binds the record revision",
+                clean.clone(),
+                Some(record.clone()),
+                RemovalRequest {
+                    expected_fingerprint: Some(expected_fingerprint(
+                        &clean,
+                        None,
+                        &RemovalRequest::default(),
+                        "cafe01",
+                    )),
+                    ..RemovalRequest::default()
+                },
+                vec![Veto::FingerprintMismatch],
+            ),
+            (
+                "clean merged foreign worktree with no record",
+                clean.clone(),
+                None,
+                RemovalRequest::default(),
+                Vec::new(),
+            ),
+        ];
+        for (name, observation, record, request, expected) in cases {
+            let decision = assess_removal(&observation, record.as_ref(), &request, &policy);
+            assert_eq!(decision.vetoes, expected, "case {name}");
+            assert!(
+                !decision
+                    .vetoes
+                    .iter()
+                    .any(|veto| matches!(veto, Veto::NotImplemented)),
+                "case {name} still returns not_implemented"
+            );
+        }
+    }
+
+    #[test]
+    fn assess_removal_fingerprint_presence() {
+        let policy = Policy::default();
+        let clean = clean_observation();
+        let decision = assess_removal(&clean, None, &RemovalRequest::default(), &policy);
+        assert_eq!(
+            decision.fingerprint,
+            Some(expected_fingerprint(
+                &clean,
+                None,
+                &RemovalRequest::default(),
+                "cafe01"
+            ))
+        );
+        // Incomplete status still yields a fingerprint from its evidence.
+        let incomplete = with(&clean, |o| {
+            o.status = Probe::Incomplete {
+                evidence: StatusFacts {
+                    staged: 0,
+                    unstaged: 0,
+                    untracked: 0,
+                    conflicts: 0,
+                    ignored: Vec::new(),
+                    digest: "cafe01".to_owned(),
+                },
+                reason: "output cap hit".to_owned(),
+            }
+        });
+        assert_eq!(
+            assess_removal(&incomplete, None, &RemovalRequest::default(), &policy).fingerprint,
+            decision.fingerprint
+        );
+        // No status digest means no fingerprint: never a fabricated one.
+        let blind = with(&clean, |o| o.status = Probe::NotChecked);
+        assert!(
+            assess_removal(&blind, None, &RemovalRequest::default(), &policy)
+                .fingerprint
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn assess_removal_carries_record_warnings() {
+        let policy = Policy::default();
+        let clean = clean_observation();
+        let mut record = sample_record();
+        record.removal_started = Some(RemovalStarted {
+            fingerprint: Fingerprint::parse(&"0".repeat(64)).unwrap(),
+            at: 999,
+        });
+        let decision = assess_removal(&clean, Some(&record), &RemovalRequest::default(), &policy);
+        assert!(decision.vetoes.is_empty());
+        assert!(decision.warnings.contains(&Warning::RemovalStarted));
+
+        let unmerged = with(&clean, |o| {
+            o.integration = Probe::Known(Integration::Unmerged)
+        });
+        let decision = assess_removal(&unmerged, None, &RemovalRequest::default(), &policy);
+        assert!(decision.warnings.contains(&Warning::Unmerged));
+    }
+
+    #[test]
+    fn unknown_is_never_clean() {
+        // Every unknown axis that matters produces a veto, never silence.
+        let policy = Policy::default();
+        let observation = sample_observation();
+        let decision = assess_removal(&observation, None, &RemovalRequest::default(), &policy);
+        assert_eq!(decision.vetoes, vec![Veto::ProbeUnknown]);
     }
 }

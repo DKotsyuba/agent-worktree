@@ -10,16 +10,8 @@ mod tools;
     reason = "Implemented git.rs, not yet reachable from main; remove with service wiring"
 )]
 mod git;
-#[allow(
-    dead_code,
-    reason = "Frozen store.rs contract; removed when the state module is implemented"
-)]
-mod store;
-#[allow(
-    dead_code,
-    reason = "Frozen worktree.rs contract; removed when the policy module is implemented"
-)]
-mod worktree;
+pub mod store;
+pub mod worktree;
 use clap::{Parser, Subcommand};
 use mcp_presentation::Renderer;
 use rmcp::{

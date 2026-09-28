@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "family-delivery",
+ "fs2",
  "mcp-presentation",
  "minijinja",
  "rmcp",
@@ -16,6 +17,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
