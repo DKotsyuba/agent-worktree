@@ -4,4 +4,4 @@ Branch: aw/task-1
 Head: 0f1e2d3c4b5a6978879665544332211ff1e2d3c4
 Creator: claude-code
 Purpose: ship the release
-Created: 1800000000
+Created: 2027-01-15T08:00:00Z

@@ -23,14 +23,15 @@ When the object is present, every omitted probe is `false`.
 
 Each axis is shown as known, `not checked`, `unavailable (<code>)` or
 `<value> (incomplete: <reason>)`; an unknown check is never reported as clean.
-Activity defaults: recent ≤ 24 h, idle ≥ 7 d, stale ≥ 30 d; a live process
+Activity defaults: recent < 24 h, idle ≥ 24 h, stale ≥ 30 d; a live process
 means `active`. Integration is ancestry against the configured integration ref
 (`main` until configured otherwise); squash merges are not detected.
 Size is measured only when requested; budget exhaustion reports a lower bound.
 
 ## Reply
 
-`OK worktree <id12>/<name> (<class>)` followed by labelled rows, warnings and
+`OK worktree <id12>/<name> (<class>)` followed by labelled rows (branch without
+the `refs/heads/` prefix, record creation time in UTC ISO-8601) and warnings,
 `Hygiene: stale_activity=… large=… missing=…` derived from data this call
 already collected. Degraded probes keep the reply a successful read.
 

@@ -23,7 +23,8 @@ permanent. An interrupted apply stays visible through the record's
 ## Preview
 
 Observes everything (status, integration, processes, submodules) and returns
-`PREVIEW` with the exact path, HEAD, branch, approved `disposable_paths`,
+`PREVIEW` with the exact path, HEAD, branch (without the `refs/heads/`
+prefix), approved `disposable_paths`,
 `Eligible: true/false (N vetoes)` with one `Veto:` line each, warnings, and the
 fingerprint. Vetoes on the preview are the requested answer, so the reply is
 not an execution error; apply is only meaningful when eligible.
@@ -38,8 +39,9 @@ writes `removal_started` before dispatching `git worktree remove`, deletes the
 record, then returns `COMMITTED` (or `NOOP` when already absent — including a
 replayed apply whose worktree and registration are already gone; such a replay
 also deletes a crashed removal's leftover `removal_started` record under the
-lock, warning `record_cleanup_pending` if that fails) with the retained
-branch. Foreign worktrees without records skip the marker and delete.
+lock — the caller path is canonicalized first, so a path-form replay through a
+`/var`-style alias still matches the record's bound path — warning
+`record_cleanup_pending` if that fails) with the retained branch. Foreign worktrees without records skip the marker and delete.
 The receipt is rendered from Rust if the template fails; a lost confirmation
 after dispatch returns `OUTCOME_UNKNOWN` naming the exact path to inspect.
 

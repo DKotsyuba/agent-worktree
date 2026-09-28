@@ -268,8 +268,10 @@ fn open_lock_file(lock_path: &Path) -> Result<File, StoreError> {
 /// The registry is shared by every repository, so per-repository locks cannot
 /// serialize its read-modify-write cycle; this dedicated lock does. It is
 /// polled like the repository lock and fails with `LockTimeout` past
-/// `budget.deadline`. The returned file holds the lock until dropped.
-fn lock_registry(home: &Path, budget: &Budget) -> Result<File, StoreError> {
+/// `budget.deadline`. The returned file holds the lock until dropped. Waiting
+/// uses `tokio::time::sleep` so an occupied lock never blocks a runtime
+/// worker thread.
+async fn lock_registry(home: &Path, budget: &Budget) -> Result<File, StoreError> {
     let lock_path = home.join("state").join("v1").join("registry.lock");
     let file = open_lock_file(&lock_path)?;
     loop {
@@ -282,7 +284,7 @@ fn lock_registry(home: &Path, budget: &Budget) -> Result<File, StoreError> {
                 format!("registry lock busy: {}", lock_path.display()),
             ));
         }
-        std::thread::sleep(LOCK_POLL);
+        tokio::time::sleep(LOCK_POLL).await;
     }
 }
 
@@ -684,15 +686,16 @@ pub fn read_registry(home: &Path) -> Result<Vec<KnownRepo>, StoreError> {
 /// An entry whose identity or label violates its bounded format refuses with
 /// `CorruptRecord` and nothing is written. An existing entry with the same
 /// `repo_id` is replaced; entries are kept sorted by `repo_id` and written with
-/// the same atomic replacement as records.
-pub fn add_known_repo(
+/// the same atomic replacement as records. Lock waiting is asynchronous, so
+/// the caller `await`s this function without blocking a runtime worker.
+pub async fn add_known_repo(
     home: &Path,
     _guard: &RepoLockGuard,
     budget: &Budget,
     entry: &KnownRepo,
 ) -> Result<(), StoreError> {
     validate_entry(entry)?;
-    let _registry_lock = lock_registry(home, budget)?;
+    let _registry_lock = lock_registry(home, budget).await?;
     let mut repos = read_registry(home)?;
     match repos
         .iter_mut()
@@ -900,7 +903,6 @@ mod tests {
             creator: "harness".to_owned(),
             session: None,
             purpose: None,
-            ttl_secs: None,
             revision: 0,
             removal_started: None,
         }
@@ -995,7 +997,6 @@ mod tests {
         let mut record = sample_record();
         record.session = Some("sess-1".to_owned());
         record.purpose = Some("investigate flaky test".to_owned());
-        record.ttl_secs = Some(3_600);
         let stored = replace_record(home.path(), &guard, &record, 0).unwrap();
         assert_eq!(read_record(home.path(), &id, &name).unwrap(), Some(stored));
 
@@ -1003,12 +1004,10 @@ mod tests {
         let stored = replace_record(home.path(), &guard, &sample_record(), 1).unwrap();
         assert_eq!(stored.session, None);
         assert_eq!(stored.purpose, None);
-        assert_eq!(stored.ttl_secs, None);
         let on_disk = fs::read(record_path(home.path(), id.as_str(), name.as_str())).unwrap();
         let on_disk = String::from_utf8_lossy(&on_disk);
         assert!(!on_disk.contains("session"));
         assert!(!on_disk.contains("purpose"));
-        assert!(!on_disk.contains("ttl_secs"));
     }
 
     #[tokio::test]
@@ -1258,6 +1257,7 @@ mod tests {
             &b,
             &known_repo(a.as_str(), Path::new("/repo-a/.git")),
         )
+        .await
         .unwrap();
         add_known_repo(
             home.path(),
@@ -1265,6 +1265,7 @@ mod tests {
             &b,
             &known_repo(repo_id('b').as_str(), Path::new("/repo-b/.git")),
         )
+        .await
         .unwrap();
         // Re-adding the same identity refreshes rather than duplicates.
         add_known_repo(
@@ -1273,6 +1274,7 @@ mod tests {
             &b,
             &known_repo(a.as_str(), Path::new("/moved-a/.git")),
         )
+        .await
         .unwrap();
         let repos = read_registry(home.path()).unwrap();
         assert_eq!(repos.len(), 2);
@@ -1302,6 +1304,7 @@ mod tests {
                     &budget(10_000),
                     &known_repo(a.as_str(), Path::new("/a/.git")),
                 )
+                .await
                 .unwrap();
             })
         };
@@ -1316,6 +1319,7 @@ mod tests {
                     &budget(10_000),
                     &known_repo(b.as_str(), Path::new("/b/.git")),
                 )
+                .await
                 .unwrap();
             })
         };
@@ -1380,6 +1384,7 @@ mod tests {
         invalid.label = "-bad".to_owned();
         assert_eq!(
             add_known_repo(home.path(), &guard, &budget(10_000), &invalid)
+                .await
                 .unwrap_err()
                 .code,
             StoreErrorCode::CorruptRecord
@@ -1485,6 +1490,7 @@ mod tests {
                 &fs::canonicalize(scan.join("repoA/.git")).unwrap(),
             ),
         )
+        .await
         .unwrap();
         let layout = Layout {
             home,

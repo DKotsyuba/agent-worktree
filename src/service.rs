@@ -340,7 +340,7 @@ impl Service {
             integration_ref,
             registered_at: now,
         };
-        if let Err(error) = store::add_known_repo(&layout.home, &guard, &op_budget, &entry) {
+        if let Err(error) = store::add_known_repo(&layout.home, &guard, &op_budget, &entry).await {
             warnings.push(format!("registry_write_failed: {}", error.code.as_str()));
         }
         // The record is written after the confirmed effect; a failure here is a
@@ -357,7 +357,6 @@ impl Service {
             creator: crate::response::bounded(&args.creator, 64),
             session: args.session.clone(),
             purpose: Some(args.purpose.clone()),
-            ttl_secs: args.ttl,
             revision: 0,
             removal_started: None,
         };
@@ -493,6 +492,8 @@ impl Service {
                     || !registration.path.try_exists().unwrap_or(false)
                 {
                     WorktreeClass::Missing
+                } else if registration.is_main {
+                    WorktreeClass::Main
                 } else if record.is_some() {
                     WorktreeClass::Managed
                 } else {
@@ -524,7 +525,20 @@ impl Service {
             let repo_dir = layout
                 .root
                 .join(worktree::repo_directory(&scope.label, &scope.repo_id));
-            if let Ok(entries) = std::fs::read_dir(&repo_dir) {
+            let entries = match std::fs::read_dir(&repo_dir) {
+                Ok(entries) => Some(entries),
+                Err(error) => {
+                    // An absent per-repo directory simply has no orphan
+                    // candidates; any other read failure is named in
+                    // coverage so `orphan=0` is never shown for a directory
+                    // that could not be read.
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        failed.push((scope.repo_id.id12().to_owned(), "orphan_scan_failed"));
+                    }
+                    None
+                }
+            };
+            if let Some(entries) = entries {
                 for (scanned, entry) in entries.flatten().enumerate() {
                     if scanned == MAX_ORPHAN_ENTRIES {
                         orphan_scan_truncated = true;
@@ -678,9 +692,12 @@ impl Service {
                 .filter(|r| r.class == WorktreeClass::OrphanCandidate)
                 .count(),
             removal_started: page.iter().filter(|r| r.removal_started).count(),
-            // Stale rows are at least 7 days old too, so they count as idle.
+            // Main checkouts are context rows, not cleanup candidates, so the
+            // age, mergedness and size counters cover linked worktrees only.
+            // Stale rows are at least 24 h old too, so they count as idle.
             idle: page
                 .iter()
+                .filter(|r| r.class != WorktreeClass::Main)
                 .filter(|r| {
                     matches!(
                         r.activity,
@@ -690,13 +707,21 @@ impl Service {
                 .count(),
             stale: page
                 .iter()
+                .filter(|r| r.class != WorktreeClass::Main)
                 .filter(|r| r.activity == Some(Activity::StaleCandidate))
                 .count(),
             unmerged: page
                 .iter()
+                .filter(|r| r.class != WorktreeClass::Main)
                 .filter(|r| r.integration == Some(Integration::Unmerged))
                 .count(),
-            large: include_size && page.iter().filter(|r| r.large(&self.policy)).count() > 0,
+            large: include_size
+                && page
+                    .iter()
+                    .filter(|r| r.class != WorktreeClass::Main)
+                    .filter(|r| r.large(&self.policy))
+                    .count()
+                    > 0,
         }
     }
 
@@ -735,6 +760,8 @@ impl Service {
         }
         let class = if !target.path.try_exists().unwrap_or(false) {
             WorktreeClass::Missing
+        } else if target.is_main {
+            WorktreeClass::Main
         } else if record.is_some() {
             WorktreeClass::Managed
         } else {
@@ -954,9 +981,22 @@ impl Service {
     }
 
     /// Prunes stale registrations repository-wide; dry run by default.
+    ///
+    /// The dry run is keyset-paginated over the sorted candidates (`cursor`
+    /// and `limit`, at most [`MAX_PAGE_ROWS`]) so an oversized preview is
+    /// paged through instead of refused; apply stays repository-wide and
+    /// prunes every candidate at once.
     pub async fn prune_worktrees(&self, args: &PruneArgs) -> Result<PruneOutcome, ServiceError> {
         validate_repo_path(&args.repo)?;
         let dry_run = args.dry_run.unwrap_or(true);
+        let limit = args.limit.unwrap_or(MAX_PAGE_ROWS);
+        if limit == 0 || limit > MAX_PAGE_ROWS {
+            return Err(ServiceError::blocked(
+                "limit_out_of_range",
+                format!("limit must be between 1 and {MAX_PAGE_ROWS}"),
+            ));
+        }
+        let after = args.cursor.as_deref().map(parse_prune_cursor).transpose()?;
         let layout = self.layout()?;
         let scope = self.repo_scope(&layout, &args.repo).await?;
         let op_budget = budget(MUTATION_SECS);
@@ -972,6 +1012,7 @@ impl Service {
                 }
             })?;
         let mut warnings = Vec::new();
+        let total = result.candidates.len();
         if result.applied {
             // A pruned registration's record is stale (no registration, no
             // directory); remove it so a later create does not hit a phantom
@@ -1000,9 +1041,46 @@ impl Service {
                 }
             }
         }
+        // The preview pages over stably sorted paths; the apply above pruned
+        // every candidate, so it reports the full list with no cursor.
+        let (candidates, has_more, cursor) = if result.applied {
+            (result.candidates, false, None)
+        } else {
+            if let Some((cursor_repo, _)) = &after
+                && cursor_repo != scope.repo_id.as_str()
+            {
+                return Err(ServiceError::blocked(
+                    "cursor_scope_mismatch",
+                    "cursor belongs to a different repository",
+                )
+                .with_next("request the first page without a cursor"));
+            }
+            let mut sorted = result.candidates;
+            sorted.sort();
+            let remaining: Vec<PathBuf> = sorted
+                .into_iter()
+                .filter(|path| {
+                    after
+                        .as_ref()
+                        .is_none_or(|(_, cursor_path)| path > cursor_path)
+                })
+                .collect();
+            let has_more = remaining.len() > limit;
+            let page: Vec<PathBuf> = remaining.into_iter().take(limit).collect();
+            let cursor = has_more
+                .then(|| {
+                    page.last()
+                        .map(|path| encode_prune_cursor(&scope.repo_id, path))
+                })
+                .flatten();
+            (page, has_more, cursor)
+        };
         Ok(PruneOutcome {
             repo_id: scope.repo_id.id12().to_owned(),
-            candidates: result.candidates,
+            candidates,
+            total,
+            has_more,
+            cursor,
             applied: result.applied,
             warnings,
         })
@@ -1068,6 +1146,7 @@ impl Service {
                 path: registration.path.clone(),
                 head: registration.head.clone(),
                 branch: registration.branch.clone(),
+                is_main: registration.is_main,
             },
         })
     }
@@ -1091,6 +1170,8 @@ struct Target {
     path: PathBuf,
     head: Option<String>,
     branch: Option<String>,
+    /// Whether the registration is the repository's main checkout.
+    is_main: bool,
 }
 
 /// Best-effort (name, path) identity for an apply replay that found nothing.
@@ -1104,8 +1185,30 @@ fn replay_target(layout: &Layout, scope: &RepoScope, args: &RemoveArgs) -> (Stri
             root.join(worktree::repo_directory(&scope.label, &scope.repo_id))
                 .join(name),
         ),
-        (_, Some(path)) => (base_name(Path::new(path)), PathBuf::from(path)),
+        (_, Some(path)) => (base_name(Path::new(path)), canonicalize_gone(path)),
         _ => (String::new(), PathBuf::new()),
+    }
+}
+
+/// Canonicalizes a caller path for comparison with a record's bound path.
+///
+/// The tree is normally gone by the time a replay runs, so when the path
+/// itself cannot be canonicalized its surviving parent is resolved and the
+/// file name re-joined; `/var`-style aliases and symlinked roots then compare
+/// equal to the canonical path stored at creation. A path with no resolvable
+/// parent is returned unchanged.
+fn canonicalize_gone(path: &str) -> PathBuf {
+    let raw = Path::new(path);
+    if let Ok(resolved) = std::fs::canonicalize(raw) {
+        return resolved;
+    }
+    match (
+        raw.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok()),
+        raw.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => raw.to_owned(),
     }
 }
 
@@ -1269,8 +1372,10 @@ pub enum PageFit {
 /// Fits at most `limit` rows under the page row-byte budget.
 ///
 /// Keyset order makes a shrunk page safe: the next page resumes exactly after
-/// the last shown row, so no row is skipped. A single row that cannot fit
-/// refuses the page instead of truncating an identifier.
+/// the last shown row, so no row is skipped. The cursor emitted for a page
+/// with more rows is page furniture charged against the same budget, so
+/// trailing rows are dropped until row bytes plus cursor fit; a single row
+/// that cannot fit refuses the page instead of truncating an identifier.
 fn fit_rows(rows: Vec<ListRow>, limit: usize) -> PageFit {
     let mut kept = Vec::with_capacity(limit.min(rows.len()));
     let mut used = 0usize;
@@ -1288,8 +1393,17 @@ fn fit_rows(rows: Vec<ListRow>, limit: usize) -> PageFit {
         used += line;
         kept.push(row);
     }
+    // Charge the encoded cursor of the last shown row against the budget; a
+    // long path inflates the cursor past the furniture left beside the rows.
+    while has_more
+        && let Some(last) = kept.last()
+        && used.saturating_add(encoded_cursor_len(&last.repo_id, &last.path)) > PAGE_ROW_BUDGET
+        && let Some(dropped) = kept.pop()
+    {
+        used = used.saturating_sub(row_line_bytes(&dropped));
+    }
     if kept.is_empty() && has_more {
-        // Rows existed but not even one fits: refuse rather than truncate.
+        // Rows existed but not even one row plus its cursor fits: refuse.
         return PageFit::Refused;
     }
     PageFit::Fit {
@@ -1298,17 +1412,27 @@ fn fit_rows(rows: Vec<ListRow>, limit: usize) -> PageFit {
     }
 }
 
+/// Upper bound of the cursor `encode_cursor` emits for one row position.
+///
+/// The scope digest is fixed-size, so the length follows from the encoded
+/// byte count alone: `awlist1` + 32 digest bytes + repo id + NUL + raw path
+/// bytes, base64 at four characters per three bytes.
+fn encoded_cursor_len(repo_id: &str, path: &Path) -> usize {
+    4 * (7 + 32 + repo_id.len() + 1 + path.as_os_str().as_encoded_bytes().len()).div_ceil(3)
+}
+
 /// Upper bound of one rendered list row line in bytes.
 fn row_line_bytes(row: &ListRow) -> usize {
-    // Worst-case cells: activity `stale_candidate~` (16), integration
-    // `unmerged` (8), size `999.9 TiB (lower bound)` (26), creator ≤ 64.
+    // Worst-case cells: branch fallback `detached` (8), activity
+    // `stale_candidate~` (16), integration `unmerged` (8), size
+    // `16777216.0 TiB (lower bound)` (28) or `unmeasured` (10), creator ≤ 64.
     row.key.len()
         + row.class_label().len()
-        + row.branch.as_deref().map_or(7, str::len)
+        + row.branch.as_deref().map_or(8, str::len)
         + row.creator.as_ref().map_or(1, |c| c.len())
         + 16
         + 8
-        + row.size.as_ref().map_or(1, |_| 26)
+        + row.size.as_ref().map_or(10, |_| 28)
         + row.path.display().to_string().len()
         // Seven " | " separators plus the newline.
         + 21
@@ -1367,6 +1491,43 @@ fn parse_cursor(encoded: &str) -> Result<CursorKey, ServiceError> {
         repo_id: repo_id.to_owned(),
         path,
     })
+}
+
+/// Encodes one prune-preview cursor: repository identity plus last shown path.
+fn encode_prune_cursor(repo_id: &RepoId, path: &Path) -> String {
+    let mut bytes = Vec::with_capacity(8 + 64 + path.as_os_str().len());
+    bytes.extend_from_slice(b"awprune1");
+    bytes.extend_from_slice(repo_id.as_str().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(path.as_os_str().as_encoded_bytes());
+    base64_url_encode(&bytes)
+}
+
+/// Structurally decodes one prune-preview cursor.
+fn parse_prune_cursor(encoded: &str) -> Result<(String, PathBuf), ServiceError> {
+    let invalid = || ServiceError::blocked("cursor_invalid", "cursor could not be decoded");
+    let bytes = base64_url_decode(encoded).ok_or_else(invalid)?;
+    if bytes.len() < 8 + 64 + 1 + 1 || &bytes[..8] != b"awprune1" {
+        return Err(invalid());
+    }
+    let rest = &bytes[8..];
+    let split = rest.iter().position(|b| *b == 0).ok_or_else(invalid)?;
+    let repo_id = std::str::from_utf8(&rest[..split]).map_err(|_| invalid())?;
+    if RepoId::parse(repo_id).is_err() {
+        return Err(invalid());
+    }
+    // Paths are raw OS bytes, not guaranteed UTF-8; decode them losslessly.
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(&rest[split + 1..]))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(std::str::from_utf8(&rest[split + 1..]).map_err(|_| invalid())?);
+    if path.as_os_str().is_empty() {
+        return Err(invalid());
+    }
+    Ok((repo_id.to_owned(), path))
 }
 
 /// Checks a decoded cursor against the digest of the current scope.
@@ -1483,8 +1644,6 @@ pub struct CreateArgs {
     pub session: Option<String>,
     /// Why the worktree exists, at most 200 characters.
     pub purpose: String,
-    /// Advisory lifetime in seconds.
-    pub ttl: Option<u64>,
 }
 
 impl CreateArgs {
@@ -1512,14 +1671,6 @@ impl CreateArgs {
             validate_attribution(session, 128, "session_invalid")?;
         }
         validate_attribution(&self.purpose, 200, "purpose_invalid")?;
-        if let Some(ttl) = self.ttl
-            && !(60..=31_536_000).contains(&ttl)
-        {
-            return Err(ServiceError::blocked(
-                "ttl_out_of_range",
-                "ttl must be between 60 and 31536000 seconds",
-            ));
-        }
         Ok(name)
     }
 }
@@ -1529,7 +1680,7 @@ impl Record {
     ///
     /// Every persisted intake field participates: base, branch (in the form
     /// `git::create` reports, without a `refs/heads/` prefix), creator,
-    /// session, purpose and ttl.
+    /// session and purpose.
     fn matches_request(&self, args: &CreateArgs) -> bool {
         let requested_branch = if args.detached {
             None
@@ -1544,7 +1695,6 @@ impl Record {
             && self.creator == crate::response::bounded(&args.creator, 64)
             && self.session == args.session
             && self.purpose.as_deref() == Some(args.purpose.as_str())
-            && self.ttl_secs == args.ttl
     }
 }
 
@@ -1667,6 +1817,10 @@ pub struct PruneArgs {
     pub repo: String,
     /// List candidates only; the default.
     pub dry_run: Option<bool>,
+    /// Keyset cursor from the previous preview page.
+    pub cursor: Option<String>,
+    /// Candidates per preview page, between 1 and 20.
+    pub limit: Option<usize>,
 }
 
 /// Validates a caller-supplied repository path argument.
@@ -1767,6 +1921,7 @@ impl ListRow {
     /// Stable label for the ownership class.
     pub fn class_label(&self) -> &'static str {
         match self.class {
+            WorktreeClass::Main => "main",
             WorktreeClass::Managed => "managed",
             WorktreeClass::Foreign => "foreign",
             WorktreeClass::Missing => "missing",
@@ -1774,10 +1929,11 @@ impl ListRow {
         }
     }
 
-    /// Display label for the branch axis.
+    /// Display label for the branch axis, without the `refs/heads/` prefix.
     pub fn branch_label(&self) -> &str {
         self.branch
             .as_deref()
+            .map(crate::response::short_branch)
             .unwrap_or(if self.detached { "detached" } else { "unknown" })
     }
 
@@ -1861,6 +2017,7 @@ pub struct InspectOutcome {
 /// Classification label shared with the tools layer.
 pub fn class_label(class: WorktreeClass) -> &'static str {
     match class {
+        WorktreeClass::Main => "main",
         WorktreeClass::Managed => "managed",
         WorktreeClass::Foreign => "foreign",
         WorktreeClass::Missing => "missing",
@@ -1933,8 +2090,14 @@ impl From<git::RemoveOutcome> for RemoveOutcomeKind {
 pub struct PruneOutcome {
     /// Repository identity prefix.
     pub repo_id: String,
-    /// Registrations eligible (dry run) or pruned (apply).
+    /// Registrations eligible (dry run: this page) or pruned (apply: all).
     pub candidates: Vec<PathBuf>,
+    /// Total eligible candidates in the repository.
+    pub total: usize,
+    /// Whether more preview pages remain.
+    pub has_more: bool,
+    /// Cursor resuming the preview after this page.
+    pub cursor: Option<String>,
     /// Whether pruning was applied.
     pub applied: bool,
     /// Non-blocking follow-up problems (stable codes).
@@ -1964,6 +2127,24 @@ mod tests {
         RepoId::from_common_dir(Path::new("/repo/.git"))
             .as_str()
             .to_owned()
+    }
+
+    /// A managed attached row for page-budget tests.
+    fn page_row(key: &str, path: &str) -> ListRow {
+        ListRow {
+            key: key.to_owned(),
+            repo_id: sample_id(),
+            path: PathBuf::from(path),
+            class: WorktreeClass::Managed,
+            branch: Some("refs/heads/aw/x".to_owned()),
+            detached: false,
+            head: None,
+            creator: None,
+            removal_started: false,
+            activity: None,
+            integration: None,
+            size: None,
+        }
     }
 
     #[test]
@@ -2019,24 +2200,8 @@ mod tests {
 
     #[test]
     fn fit_rows_respects_limit_and_budget() {
-        fn row(key: &str, path: &str) -> ListRow {
-            ListRow {
-                key: key.to_owned(),
-                repo_id: sample_id(),
-                path: PathBuf::from(path),
-                class: WorktreeClass::Managed,
-                branch: Some("refs/heads/aw/x".to_owned()),
-                detached: false,
-                head: None,
-                creator: None,
-                removal_started: false,
-                activity: None,
-                integration: None,
-                size: None,
-            }
-        }
         let rows = (0..30)
-            .map(|i| row(&format!("r{i}"), &format!("/w/r{i}")))
+            .map(|i| page_row(&format!("r{i}"), &format!("/w/r{i}")))
             .collect();
         let PageFit::Fit {
             rows: page,
@@ -2061,9 +2226,77 @@ mod tests {
 
         let long = "/w/".to_owned() + &"p".repeat(PAGE_ROW_BUDGET);
         assert!(matches!(
-            fit_rows(vec![row("big", &long)], 5),
+            fit_rows(vec![page_row("big", &long)], 5),
             PageFit::Refused
         ));
+    }
+
+    #[test]
+    fn row_line_bytes_upper_binds_the_widest_rendered_line() {
+        let mut row = page_row("0123456789ab/task-1", "/tmp/w/demo--0123456789ab/task-1");
+        row.branch = None;
+        row.detached = true;
+        row.creator = Some("c".repeat(64));
+        row.activity = Some(Activity::StaleCandidate);
+        row.integration = Some(Integration::Unmerged);
+        row.size = Some(worktree::Size {
+            bytes: u64::MAX,
+            quality: worktree::SizeQuality::LowerBound,
+        });
+        let widest_size = format!("{} (lower bound)", crate::response::human_bytes(u64::MAX));
+        let rendered = format!(
+            "{} | {} | detached | {} | {}~ | unmerged | {widest_size} | {}\n",
+            row.key,
+            row.class_label(),
+            row.creator.as_deref().unwrap(),
+            activity_label(Activity::StaleCandidate),
+            row.path.display(),
+        );
+        assert!(row_line_bytes(&row) >= rendered.len());
+        // The unmeasured fallback fits its reserved slot as well.
+        row.size = None;
+        assert!(row_line_bytes(&row) >= rendered.replace(&widest_size, "unmeasured").len());
+    }
+
+    #[test]
+    fn fit_rows_charges_the_encoded_cursor() {
+        // Long paths inflate the cursor (~4/3 of the path bytes) past the
+        // furniture beside the rows, so the page shrinks to make room.
+        let rows = (0..30)
+            .map(|i| page_row(&format!("r{i}"), &format!("/w/{}{i}", "p".repeat(1020))))
+            .collect();
+        let PageFit::Fit {
+            rows: page,
+            has_more,
+        } = fit_rows(rows, 20)
+        else {
+            panic!("expected a fitted page");
+        };
+        assert!(has_more);
+        let used: usize = page.iter().map(row_line_bytes).sum();
+        let last = page.last().unwrap();
+        assert!(used + encoded_cursor_len(&last.repo_id, &last.path) <= PAGE_ROW_BUDGET);
+
+        // A row that fits alone but whose cursor cannot, with more rows
+        // behind it: refuse rather than drop the continuation silently.
+        let huge = "/w/".to_owned() + &"p".repeat(6000);
+        assert!(matches!(
+            fit_rows(vec![page_row("big", &huge), page_row("big2", &huge)], 5),
+            PageFit::Refused
+        ));
+    }
+
+    #[test]
+    fn prune_cursor_round_trip() {
+        let id = RepoId::from_common_dir(Path::new("/repo/.git"));
+        let cursor = encode_prune_cursor(&id, Path::new("/w/repo--x/old-task"));
+        let (repo_id, path) = parse_prune_cursor(&cursor).unwrap();
+        assert_eq!(repo_id, id.as_str());
+        assert_eq!(path, Path::new("/w/repo--x/old-task"));
+        assert!(parse_prune_cursor("nonsense").is_err());
+        // A list cursor is not a prune cursor.
+        let list_cursor = encode_cursor(&[0u8; 32], id.as_str(), Path::new("/w/x"));
+        assert!(parse_prune_cursor(&list_cursor).is_err());
     }
 
     #[test]
@@ -2089,7 +2322,6 @@ mod tests {
             creator: "claude-code".to_owned(),
             session: None,
             purpose: "ship it".to_owned(),
-            ttl: None,
         };
         assert_eq!(base("ok-1").validate().unwrap().as_str(), "ok-1");
         assert_eq!(base("BAD").validate().unwrap_err().code, "name_charset");
@@ -2104,9 +2336,6 @@ mod tests {
         let mut long_purpose = base("ok-1");
         long_purpose.purpose = "x".repeat(201);
         assert_eq!(long_purpose.validate().unwrap_err().code, "purpose_invalid");
-        let mut bad_ttl = base("ok-1");
-        bad_ttl.ttl = Some(10);
-        assert_eq!(bad_ttl.validate().unwrap_err().code, "ttl_out_of_range");
     }
 
     #[test]

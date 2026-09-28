@@ -63,12 +63,6 @@
           "description": "Creating session identifier.",
           "maxLength": 128,
           "type": "string"
-        },
-        "ttl": {
-          "description": "Advisory lifetime in seconds.",
-          "maximum": 31536000,
-          "minimum": 60,
-          "type": "integer"
         }
       },
       "required": [
@@ -88,7 +82,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List worktrees across the managed scope with ownership classification (managed, foreign, missing, orphan_candidate) and cheap per-row signals: mtime-based activity band (recent~/idle~/stale~) and mergedness. Read-only. Keyset-paginated, at most 20 rows per page; orphan candidates are never automatically deletable.",
+    "description": "List worktrees across the managed scope with ownership classification (main, managed, foreign, missing, orphan_candidate) and cheap per-row signals: mtime-based activity band (recent~/idle~/stale~) and mergedness. Read-only. Keyset-paginated, at most 20 rows per page; main checkouts are context rows excluded from the hygiene counters, and orphan candidates are never automatically deletable.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -237,13 +231,23 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Prune stale worktree registrations for one repository. dry_run=true (the default) lists missing, unlocked registrations; dry_run=false runs native git worktree prune, which removes registrations only, never branches or existing directories.",
+    "description": "Prune stale worktree registrations for one repository. dry_run=true (the default) lists missing, unlocked registrations page by page (keyset cursor, at most 20 paths per page); dry_run=false runs native git worktree prune repository-wide, which removes registrations only, never branches or existing directories.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "cursor": {
+          "description": "Cursor from the previous preview page.",
+          "type": "string"
+        },
         "dry_run": {
           "description": "List candidates only; default true.",
           "type": "boolean"
+        },
+        "limit": {
+          "description": "Candidate paths per preview page; default 20.",
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
         },
         "repo": {
           "description": "Repository root or any worktree inside it.",

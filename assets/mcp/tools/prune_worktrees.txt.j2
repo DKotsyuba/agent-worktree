@@ -1,9 +1,12 @@
-{{ status }} prune_worktrees {{ repo }}: {{ count }} registrations; applied={{ applied }}
+{{ status }} prune_worktrees {{ repo }}: {{ total }} candidates; showing {{ shown }}; applied={{ applied }}
 {% for row in rows %}
 {{ row }}
 {% endfor %}
-{% if listing_refused %}
-Listing: refused ({{ total }} candidates exceed the 20-row page budget); rerun with a narrower scope.
+{% if has_more %}
+More: yes (use the cursor for the next preview page)
+{% endif %}
+{% if cursor %}
+Cursor: {{ cursor }}
 {% endif %}
 {% if warnings %}
 Warnings: {{ warnings }}

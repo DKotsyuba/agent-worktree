@@ -19,15 +19,14 @@ branch. Creation registers the repository in the known-repo registry.
 | `creator` | yes | 1–64 printable single-line characters |
 | `session` | no | 1–128 printable single-line characters |
 | `purpose` | yes | 1–200 printable single-line characters |
-| `ttl` | no | 60–31 536 000 seconds |
 
-All intake fields (`base`, `branch`, `creator`, `session`, `purpose`, `ttl`) are
+All intake fields (`base`, `branch`, `creator`, `session`, `purpose`) are
 stored in the record and compared on replay.
 
 ## Behaviour
 
 - `COMMITTED worktree <id12>/<name>` with exact path, branch, HEAD, creator,
-  purpose and creation time.
+  purpose and creation time (UTC ISO-8601).
 - Replay with the same persisted metadata: `NOOP`, reconciling against the
   original destination; nothing is recreated or overwritten.
 - `base` combined with an existing `branch` is refused (Git would check the
@@ -41,7 +40,7 @@ stored in the record and compared on replay.
 
 - `invalid_arguments` — unknown field, missing required field, or a bound above.
 - `name_length` / `name_charset` / `branch_unsafe` / `creator_invalid` /
-  `session_invalid` / `purpose_invalid` / `ttl_out_of_range` / `repo_path_invalid`.
+  `session_invalid` / `purpose_invalid` / `repo_path_invalid`.
 - `conflict` — destination exists without a matching record, a record exists
   with a different metadata binding, the path exists on disk, or the existing
   registration's path is gone (hint: prune first). Nothing is overwritten and

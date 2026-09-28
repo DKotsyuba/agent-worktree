@@ -181,6 +181,8 @@ pub struct Registration {
 /// Ownership classification of a worktree path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WorktreeClass {
+    /// The repository's main checkout; context only, never a cleanup candidate.
+    Main,
     /// Created through this product and backed by a record.
     Managed,
     /// Registered with Git without product metadata.
@@ -346,9 +348,6 @@ pub struct Record {
     /// Caller-stated purpose of the worktree; at most 200 characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
-    /// Caller-stated time-to-live in seconds; unenforced metadata.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_secs: Option<u64>,
     /// Optimistic concurrency counter; bumped on every successful write.
     pub revision: u64,
     /// Written before a removal is dispatched, so interrupts stay visible.
@@ -454,9 +453,9 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            revision: 1,
+            revision: 2,
             recent_after_secs: 24 * 60 * 60,
-            idle_after_secs: 7 * 24 * 60 * 60,
+            idle_after_secs: 24 * 60 * 60,
             stale_after_secs: 30 * 24 * 60 * 60,
             size_warning_bytes: 2_u64 << 30,
         }
@@ -639,10 +638,10 @@ pub struct Budget {
 /// Classifies an observation into activity advice and warnings.
 ///
 /// Ordering rules: a live process is `Active`; otherwise the newest available
-/// signal decides, by explicit bands — age ≤ `recent_after_secs` is `Recent`,
+/// signal decides, by explicit bands — age < `recent_after_secs` is `Recent`,
 /// age ≥ `idle_after_secs` is `IdleCandidate`, age ≥ `stale_after_secs` is
-/// `StaleCandidate`. The gap strictly between `recent_after_secs` and
-/// `idle_after_secs` also yields `Recent`, deliberately: claiming activity for
+/// `StaleCandidate`. A gap strictly between `recent_after_secs` and
+/// `idle_after_secs` would also yield `Recent`, deliberately: claiming activity for
 /// longer is the conservative direction and never fabricates abandonment. A
 /// signal timestamped in the future counts as age 0 (clock-skew tolerance).
 /// Missing signals yield `Unknown`. The policy must satisfy `Policy::validate`.
@@ -1063,7 +1062,6 @@ mod tests {
             creator: "harness".to_owned(),
             session: None,
             purpose: None,
-            ttl_secs: None,
             revision: 3,
             removal_started: None,
         }
@@ -1118,10 +1116,10 @@ mod tests {
                 Activity::Recent,
             ),
             (
-                "between recent and idle stays recent",
+                "just past recent is idle",
                 Probe::Known(false),
                 signals(Some(now - 25 * hour), None, None),
-                Activity::Recent,
+                Activity::IdleCandidate,
             ),
             (
                 "newest signal decides",
@@ -1132,7 +1130,7 @@ mod tests {
             (
                 "idle boundary",
                 Probe::Known(false),
-                signals(None, None, Some(now - 7 * day)),
+                signals(None, None, Some(now - 24 * hour)),
                 Activity::IdleCandidate,
             ),
             (

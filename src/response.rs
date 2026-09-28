@@ -214,6 +214,42 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Drops the `refs/heads/` prefix from a branch ref for display.
+///
+/// The full ref stays authoritative everywhere else; this is rendering only.
+#[must_use]
+pub fn short_branch(branch: &str) -> &str {
+    branch.strip_prefix("refs/heads/").unwrap_or(branch)
+}
+
+/// Formats unix seconds as UTC ISO-8601 (`2027-01-15T08:00:00Z`).
+#[must_use]
+pub fn iso_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let day_secs = secs % 86_400;
+    // Civil date from days since the epoch (Howard Hinnant's algorithm).
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let doe = (shifted - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        day_secs / 3600,
+        day_secs / 60 % 60,
+        day_secs % 60
+    )
+}
+
 /// Joins stable warning codes into one bounded display line.
 #[must_use]
 pub fn join_warnings(warnings: &[String]) -> Option<String> {

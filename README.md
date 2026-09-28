@@ -21,8 +21,10 @@ cannot reconstruct — who created a worktree, why, and when.
 | [`prune_worktrees`](docs/tools/prune_worktrees.md) | external-write | drop registrations of missing worktrees; dry run by default |
 
 Behaviour truth source: [docs/architecture.md](docs/architecture.md) and
-[docs/tools/](docs/tools/). Listing warns about idle (≥ 7 days), stale
-(≥ 30 days), large (≥ 2 GiB) and missing worktrees. Removal is preview →
+[docs/tools/](docs/tools/). Listing warns about idle (≥ 24 h), stale
+(≥ 30 days), large (≥ 2 GiB) and missing worktrees; the repository's main
+checkout is listed as `main` context and never counted in those hygiene
+counters. Removal is preview →
 fingerprint → apply and refuses uncommitted or untracked files, ignored files
 outside explicitly approved disposable paths, locked worktrees, live processes,
 the main worktree, and unmerged branches without explicit consent. Pruning

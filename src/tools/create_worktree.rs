@@ -14,7 +14,7 @@ pub const TEMPLATE: &str = include_str!("../../assets/mcp/tools/create_worktree.
 
 /// Argument hint used in invalid-arguments refusals.
 const ARGS: &str = "Accepted fields: repo, name, base?, branch?, detached?, \
-creator, session?, purpose, ttl?.";
+creator, session?, purpose.";
 
 /// Typed success view rendered by the embedded template.
 #[derive(Serialize)]
@@ -26,7 +26,7 @@ struct View {
     head: String,
     creator: String,
     purpose: String,
-    created_at: u64,
+    created_at: String,
     warnings: Option<String>,
 }
 
@@ -56,8 +56,7 @@ pub fn definition() -> Value {
                 "detached":{"type":"boolean","description":"Check out base detached instead of a branch."},
                 "creator":{"type":"string","maxLength":64,"description":"Creating harness attribution."},
                 "session":{"type":"string","maxLength":128,"description":"Creating session identifier."},
-                "purpose":{"type":"string","maxLength":200,"description":"Why the worktree exists."},
-                "ttl":{"type":"integer","minimum":60,"maximum":31536000,"description":"Advisory lifetime in seconds."}},
+                "purpose":{"type":"string","maxLength":200,"description":"Why the worktree exists."}},
             "additionalProperties":false},
         "annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true}})
 }
@@ -87,7 +86,7 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
                     .as_deref()
                     .map(|p| response::bounded(p, 120))
                     .unwrap_or_else(|| "-".to_owned()),
-                created_at,
+                created_at: response::iso_utc(created_at),
                 key,
                 path: path_text.clone(),
                 branch: branch_text.clone(),
@@ -118,7 +117,7 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
                     .as_deref()
                     .map(|p| response::bounded(p, 120))
                     .unwrap_or_else(|| "-".to_owned()),
-                created_at,
+                created_at: response::iso_utc(created_at),
                 key,
                 path: path.display().to_string(),
                 branch: branch_label(&branch),
@@ -204,7 +203,7 @@ mod tests {
             head: "0f1e2d3c4b5a6978879665544332211ff1e2d3c4".to_owned(),
             creator: "claude-code".to_owned(),
             purpose: "ship the release".to_owned(),
-            created_at: 1_800_000_000,
+            created_at: "2027-01-15T08:00:00Z".to_owned(),
             warnings: None,
         };
         let text = templates()

@@ -37,8 +37,8 @@ from working files and Git administration directories.
 Worktree record, schema v1 (`src/worktree.rs` `Record`, `deny_unknown_fields`):
 `schema_version`, `repo_id`, `name`, bound `path`, `branch`, optional
 `base_ref`/`base_oid`, `created_at`, `creator` (attribution, not
-authentication), optional `session`, `purpose` (≤ 200 chars) and `ttl_secs`
-(unenforced metadata), `revision`, and optional `removal_started
+authentication), optional `session` and `purpose` (≤ 200 chars), `revision`,
+and optional `removal_started
 {fingerprint, at}`. The intake fields all participate in create-replay
 comparison: same name and same metadata is a no-op, different metadata a
 conflict.
@@ -79,7 +79,7 @@ reason }`, so an unknown check is never mistaken for a clean result.
 
 | Axis | Values | Notes |
 |---|---|---|
-| activity | `active`, `recent`, `idle_candidate`, `stale_candidate`, `unknown` | live process ⇒ active; defaults recent ≤ 24 h, idle ≥ 7 d, stale ≥ 30 d |
+| activity | `active`, `recent`, `idle_candidate`, `stale_candidate`, `unknown` | live process ⇒ active; defaults recent < 24 h, idle ≥ 24 h, stale ≥ 30 d |
 | integration | `ancestor_merged`, `unmerged`, `unknown` | ancestry against the configured integration ref only; no squash detection |
 | protection | main/bare, git-locked, live process cwd, dirty/untracked/conflicts/submodules, ignored outside approved | any hit blocks removal |
 | size | `complete`, `lower_bound`, `not_checked` | warning at ≥ 2 GiB |

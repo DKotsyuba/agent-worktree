@@ -72,6 +72,83 @@ fn init_repo(dir: &std::path::Path) {
     git(dir, &["commit", "--quiet", "-m", "initial"]);
 }
 
+/// Civil (year, month, day) from days since the epoch, for `touch -t` stamps.
+fn civil_from_days(z: i64) -> (i64, u64, u64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// `touch -t` stamp (YYYYMMDDhhmm) for whole days before now.
+fn stamp_days_ago(days: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let then = now - days * 24 * 3600;
+    let (year, month, day) = civil_from_days((then / 86_400) as i64);
+    let rest = then % 86_400;
+    format!(
+        "{year:04}{month:02}{day:02}{:02}{:02}",
+        rest / 3600,
+        rest / 60 % 60
+    )
+}
+
+/// Ages one worktree's HEAD/index mtimes and last reflog entry to `days_ago`.
+fn age_worktree(admin_dir: &std::path::Path, days_ago: u64) {
+    let stamp = stamp_days_ago(days_ago);
+    for file in ["HEAD", "index"] {
+        Command::new("touch")
+            .arg("-t")
+            .arg(&stamp)
+            .arg(admin_dir.join(file))
+            .status()
+            .unwrap();
+    }
+    let secs_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - days_ago * 24 * 3600;
+    std::fs::write(
+        admin_dir.join("logs").join("HEAD"),
+        format!(
+            "0000000000000000000000000000000000000000 \
+1111111111111111111111111111111111111111 e2e <e2e@test> {secs_ago} +0000\tageing\n"
+        )
+        .replace("\\n", "\n"),
+    )
+    .unwrap();
+    Command::new("touch")
+        .arg("-t")
+        .arg(&stamp)
+        .arg(admin_dir.join("logs").join("HEAD"))
+        .status()
+        .unwrap();
+}
+
+/// Finds one record file by worktree name under the product home.
+fn record_file(home: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let records_dir = home.join("product/state/v1/repos");
+    records_dir
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .flat_map(|entry| std::fs::read_dir(entry.path()).unwrap().flatten())
+        .find(|entry| entry.path().ends_with(format!("{name}.json")))
+        .map(|entry| entry.path())
+        .unwrap_or_else(|| panic!("record file for {name} exists"))
+}
+
 /// Spawns the server with an isolated product home and worktree root.
 async fn spawn(
     home: &std::path::Path,
@@ -153,7 +230,7 @@ async fn create_list_inspect_lifecycle() {
             &f._client,
             "create_worktree",
             serde_json::json!({"repo": repo, "name": "task-1", "creator": "claude-code",
-                "session": "sess-7", "purpose": "ship the release", "ttl": 86400}),
+                "session": "sess-7", "purpose": "ship the release"}),
         )
         .await;
         assert!(!error, "{text}");
@@ -173,7 +250,7 @@ async fn create_list_inspect_lifecycle() {
             &f._client,
             "create_worktree",
             serde_json::json!({"repo": repo, "name": "task-1", "creator": "claude-code",
-                "session": "sess-7", "purpose": "ship the release", "ttl": 86400}),
+                "session": "sess-7", "purpose": "ship the release"}),
         )
         .await;
         assert!(!error, "{text}");
@@ -205,8 +282,8 @@ async fn create_list_inspect_lifecycle() {
         assert!(row.contains("managed"), "{row}");
         assert!(row.contains("claude-code"), "{row}");
         assert!(text.contains("Hygiene (page): "), "{text}");
-        // The main worktree appears as foreign.
-        assert!(text.contains("| foreign |"), "{text}");
+        // The main worktree appears as its own context class.
+        assert!(text.contains("/repo | main |"), "{text}");
 
         // Inspect surfaces the record line and clean probes.
         let (error, text) = call_text(
@@ -226,7 +303,7 @@ async fn create_list_inspect_lifecycle() {
             text.contains("Status: staged=0 unstaged=0 untracked=0"),
             "{text}"
         );
-        assert!(text.contains("session=sess-7 ttl=86400s"), "{text}");
+        assert!(text.contains("session=sess-7"), "{text}");
         let _ = path;
 
         f._client.cancel().await.unwrap();
@@ -333,10 +410,7 @@ async fn removal_vetoes_fingerprint_apply_and_replay() {
             receipt.starts_with("COMMITTED remove_worktree "),
             "{receipt}"
         );
-        assert!(
-            receipt.contains("retained (refs/heads/aw/task-1)"),
-            "{receipt}"
-        );
+        assert!(receipt.contains("retained (aw/task-1)"), "{receipt}");
         assert!(!std::path::Path::new(&path).exists(), "tree removed");
         assert!(git_ok(
             &f.repo,
@@ -493,52 +567,29 @@ async fn old_worktree_shows_as_stale_in_list_and_hygiene() {
     let f = fixture().await;
     tokio::time::timeout(Duration::from_secs(60), async {
         let repo = f.repo.display().to_string();
-        let (error, text) = call_text(
-            &f._client,
-            "create_worktree",
-            serde_json::json!({"repo": repo, "name": "old-task", "creator": "e2e",
-                "purpose": "ageing"}),
-        )
-        .await;
-        assert!(!error, "{text}");
-
-        // Age the worktree far past the 30-day stale band: HEAD/index mtimes
-        // via touch, and the last reflog entry timestamp rewritten inside the
-        // admin dir's log (classify uses the entry timestamp, not file mtime).
-        let gitdir = f.repo.join(".git").join("worktrees").join("old-task");
-        assert!(gitdir.exists(), "admin dir missing: {}", gitdir.display());
-        const OLD_STAMP: &str = "2401010000"; // 2024-01-01 00:00, years ago
-        for file in ["HEAD", "index"] {
-            Command::new("touch")
-                .arg("-t")
-                .arg(OLD_STAMP)
-                .arg(gitdir.join(file))
-                .status()
-                .unwrap();
-        }
-        let forty_days_ago = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - 40 * 24 * 3600;
-        let reflog = gitdir.join("logs").join("HEAD");
-        std::fs::write(
-            &reflog,
-            format!(
-                "0000000000000000000000000000000000000000 \
-1111111111111111111111111111111111111111 e2e <e2e@test> {forty_days_ago} +0000\tageing\n"
+        for name in ["old-task", "two-day-task"] {
+            let (error, text) = call_text(
+                &f._client,
+                "create_worktree",
+                serde_json::json!({"repo": repo, "name": name, "creator": "e2e",
+                    "purpose": "ageing"}),
             )
-            .replace("\\n", "\n"),
-        )
-        .unwrap();
-        Command::new("touch")
-            .arg("-t")
-            .arg(OLD_STAMP)
-            .arg(&reflog)
-            .status()
-            .unwrap();
+            .await;
+            assert!(!error, "{text}");
+        }
 
-        // The list itself shows the stale band and counts it in hygiene.
+        // Age one worktree far past the 30-day stale band and one just past
+        // the 24-hour idle band; classify uses the reflog entry timestamp.
+        age_worktree(&f.repo.join(".git").join("worktrees").join("old-task"), 40);
+        age_worktree(
+            &f.repo.join(".git").join("worktrees").join("two-day-task"),
+            2,
+        );
+        // The main checkout is aged past stale too: it stays a context row
+        // and never feeds the idle/stale hygiene counters.
+        age_worktree(&f.repo.join(".git"), 40);
+
+        // The list shows the bands and counts linked worktrees only.
         let (error, text) = call_text(
             &f._client,
             "list_worktrees",
@@ -546,15 +597,23 @@ async fn old_worktree_shows_as_stale_in_list_and_hygiene() {
         )
         .await;
         assert!(!error, "{text}");
-        let row = text
+        let old = text
             .lines()
             .find(|l| l.contains("/old-task |"))
             .unwrap_or_else(|| panic!("old-task row missing:\n{text}"));
-        assert!(row.contains("stale_candidate~"), "{row}");
-        assert!(text.contains("idle=1 stale=1"), "{text}");
+        assert!(old.contains("stale_candidate~"), "{old}");
+        let idle = text
+            .lines()
+            .find(|l| l.contains("/two-day-task |"))
+            .unwrap_or_else(|| panic!("two-day-task row missing:\n{text}"));
+        assert!(idle.contains("idle_candidate~"), "{idle}");
+        let main = text
+            .lines()
+            .find(|l| l.contains("/repo | main |"))
+            .unwrap_or_else(|| panic!("main row missing:\n{text}"));
+        assert!(main.contains("stale_candidate~"), "{main}");
+        assert!(text.contains("idle=2 stale=1"), "{text}");
         assert!(text.contains("Legend:"), "{text}");
-        // The freshly touched main worktree stays recent.
-        assert!(text.contains("recent~"), "{text}");
 
         f._client.cancel().await.unwrap();
     })
@@ -802,6 +861,195 @@ async fn prune_preview_applies_and_pagination_visits_every_row_once() {
                 .all(|k| k.ends_with("/task-b") || k.ends_with("/task-c") || k.ends_with("/repo")),
             "keys: {keys:?}"
         );
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
+async fn apply_replay_by_aliased_path_deletes_a_crashed_removals_record() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let repo = f.repo.display().to_string();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "alias-task", "creator": "e2e",
+                "purpose": "alias replay"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        let path = field(&text, "Path").to_owned();
+        let repo_dir = std::path::Path::new(&path).parent().unwrap().to_owned();
+
+        // Simulate a crashed removal: remember the record, apply a clean
+        // removal by name, then resurrect the record with a removal_started
+        // marker on it.
+        let record_path = record_file(f.home.path(), "alias-task");
+        let record = std::fs::read_to_string(&record_path).unwrap();
+        let (error, preview) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "alias-task", "mode": "preview"}),
+        )
+        .await;
+        assert!(!error, "{preview}");
+        let fingerprint = field(&preview, "Fingerprint");
+        let (error, receipt) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "alias-task", "mode": "apply",
+                "fingerprint": fingerprint}),
+        )
+        .await;
+        assert!(!error, "{receipt}");
+        assert!(!record_path.exists(), "record deleted by apply");
+        let crashed = record.replace(
+            "\"revision\":1",
+            &format!(
+                "\"removal_started\":{{\"fingerprint\":\"{fingerprint}\",\"at\":1}},\"revision\":1"
+            ),
+        );
+        std::fs::write(&record_path, crashed).unwrap();
+
+        // Replay the apply by path, addressed through a symlink alias of the
+        // managed root: textually different from the record's bound path,
+        // resolving to the same directory.
+        let alias = f.home.path().join("alias-root");
+        std::os::unix::fs::symlink(f.home.path().join("wt-root"), &alias).unwrap();
+        let aliased = alias.join(repo_dir.file_name().unwrap()).join("alias-task");
+        let (error, receipt) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "path": aliased.display().to_string(),
+                "mode": "apply", "fingerprint": fingerprint}),
+        )
+        .await;
+        assert!(!error, "{receipt}");
+        assert!(receipt.starts_with("NOOP remove_worktree "), "{receipt}");
+        assert!(
+            !record_path.exists(),
+            "crashed record cleaned up via the aliased path"
+        );
+
+        // The name is free again; the retained branch is checked out as-is.
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "alias-task", "creator": "e2e",
+                "purpose": "recreated", "branch": "aw/alias-task"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert!(text.starts_with("COMMITTED worktree "), "{text}");
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
+async fn unreadable_repo_directory_is_named_in_coverage() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let repo = f.repo.display().to_string();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "task-1", "creator": "e2e",
+                "purpose": "scan"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        let repo_dir = std::path::Path::new(field(&text, "Path"))
+            .parent()
+            .unwrap()
+            .to_owned();
+
+        // Replace the per-repo directory with a plain file: the orphan scan
+        // cannot read it and must say so instead of implying orphan=0.
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+        std::fs::write(&repo_dir, "not a directory\n").unwrap();
+        let (error, text) = call_text(
+            &f._client,
+            "list_worktrees",
+            serde_json::json!({"repo": repo}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert!(text.starts_with("PARTIAL worktrees"), "{text}");
+        assert!(text.contains("orphan_scan_failed"), "{text}");
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
+async fn prune_preview_paginates_oversized_candidate_lists() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let repo = f.repo.display().to_string();
+        let mut paths = Vec::new();
+        for index in 0..22 {
+            let name = format!("p-{index:02}");
+            let (error, text) = call_text(
+                &f._client,
+                "create_worktree",
+                serde_json::json!({"repo": repo, "name": name, "creator": "e2e",
+                    "purpose": "pagination"}),
+            )
+            .await;
+            assert!(!error, "{text}");
+            paths.push(field(&text, "Path").to_owned());
+        }
+        for path in &paths {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+
+        // The preview pages through all 22 candidates instead of refusing.
+        let (error, first) = call_text(
+            &f._client,
+            "prune_worktrees",
+            serde_json::json!({"repo": repo, "dry_run": true}),
+        )
+        .await;
+        assert!(!error, "{first}");
+        assert!(first.starts_with("OK prune_worktrees "), "{first}");
+        assert!(first.contains("22 candidates; showing 20"), "{first}");
+        assert!(first.contains("Cursor: "), "{first}");
+        let cursor = first
+            .lines()
+            .find_map(|l| l.strip_prefix("Cursor: "))
+            .unwrap()
+            .to_owned();
+        let (error, second) = call_text(
+            &f._client,
+            "prune_worktrees",
+            serde_json::json!({"repo": repo, "dry_run": true, "cursor": cursor}),
+        )
+        .await;
+        assert!(!error, "{second}");
+        assert!(second.contains("22 candidates; showing 2"), "{second}");
+        assert!(!second.contains("Cursor: "), "{second}");
+
+        // Apply stays repository-wide and reports the full count.
+        let (error, applied) = call_text(
+            &f._client,
+            "prune_worktrees",
+            serde_json::json!({"repo": repo, "dry_run": false}),
+        )
+        .await;
+        assert!(!error, "{applied}");
+        assert!(
+            applied.starts_with("COMMITTED prune_worktrees "),
+            "{applied}"
+        );
+        assert!(applied.contains("22 candidates; showing 22"), "{applied}");
 
         f._client.cancel().await.unwrap();
     })

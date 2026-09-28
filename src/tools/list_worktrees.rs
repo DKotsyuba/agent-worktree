@@ -120,7 +120,7 @@ fn hygiene_label(hygiene: &Hygiene, include_size: bool) -> String {
 
 pub fn definition() -> Value {
     json!({"name":"list_worktrees",
-        "description":"List worktrees across the managed scope with ownership classification (managed, foreign, missing, orphan_candidate) and cheap per-row signals: mtime-based activity band (recent~/idle~/stale~) and mergedness. Read-only. Keyset-paginated, at most 20 rows per page; orphan candidates are never automatically deletable.",
+        "description":"List worktrees across the managed scope with ownership classification (main, managed, foreign, missing, orphan_candidate) and cheap per-row signals: mtime-based activity band (recent~/idle~/stale~) and mergedness. Read-only. Keyset-paginated, at most 20 rows per page; main checkouts are context rows excluded from the hygiene counters, and orphan candidates are never automatically deletable.",
         "inputSchema":{"type":"object",
             "properties":{
                 "repo":{"type":"string","description":"Restrict the scope to one repository; omit for all known repositories."},
@@ -227,7 +227,7 @@ mod tests {
             rows: vec![RowView {
                 key: "0123456789ab/task-1".to_owned(),
                 class: "managed",
-                branch: "refs/heads/aw/task-1".to_owned(),
+                branch: "aw/task-1".to_owned(),
                 creator: "claude-code".to_owned(),
                 activity: "stale~".to_owned(),
                 integration: "unmerged".to_owned(),

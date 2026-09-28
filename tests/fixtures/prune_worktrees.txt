@@ -1,2 +1,2 @@
-OK prune_worktrees 0123456789ab: 1 registrations; applied=false
+OK prune_worktrees 0123456789ab: 1 candidates; showing 1; applied=false
 /tmp/w/demo--0123456789ab/old-task

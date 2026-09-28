@@ -199,13 +199,19 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
             .head
             .clone()
             .unwrap_or_else(|| "unknown".to_owned()),
-        branch: observation.registration.branch.clone().unwrap_or_else(|| {
-            if observation.registration.detached {
-                "detached".to_owned()
-            } else {
-                "unknown".to_owned()
-            }
-        }),
+        branch: observation
+            .registration
+            .branch
+            .as_deref()
+            .map(response::short_branch)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if observation.registration.detached {
+                    "detached".to_owned()
+                } else {
+                    "unknown".to_owned()
+                }
+            }),
         activity: activity(advice.activity),
         integration: integration_label(&observation.integration),
         status: status_label(&observation.status),
@@ -232,14 +238,12 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
             let meta = format!(
                 "creator={} created={} purpose={}",
                 r.creator,
-                r.created_at,
+                response::iso_utc(r.created_at),
                 r.purpose.as_deref().unwrap_or("-")
             );
-            let extra = match (&r.session, &r.ttl_secs) {
-                (Some(session), Some(ttl)) => format!(" session={session} ttl={ttl}s"),
-                (Some(session), None) => format!(" session={session}"),
-                (None, Some(ttl)) => format!(" ttl={ttl}s"),
-                (None, None) => String::new(),
+            let extra = match &r.session {
+                Some(session) => format!(" session={session}"),
+                None => String::new(),
             };
             response::bounded(&format!("{meta}{extra}"), 400)
         }),
@@ -329,7 +333,7 @@ mod tests {
             class: "managed",
             path: "/tmp/w/demo--0123456789ab/task-1".to_owned(),
             head: "0f1e2d3c4b5a6978879665544332211ff1e2d3c4".to_owned(),
-            branch: "refs/heads/aw/task-1".to_owned(),
+            branch: "aw/task-1".to_owned(),
             activity: "stale_candidate",
             integration: "unmerged".to_owned(),
             status: "staged=0 unstaged=0 untracked=2 conflicts=0 ignored=1".to_owned(),
@@ -337,7 +341,9 @@ mod tests {
             processes: "none".to_owned(),
             size: "not checked".to_owned(),
             locked: "-".to_owned(),
-            record: Some("creator=harness created=1800000000 purpose=ship the release".to_owned()),
+            record: Some(
+                "creator=harness created=2027-01-15T08:00:00Z purpose=ship the release".to_owned(),
+            ),
             removal_started: None,
             warnings: Some("unmerged".to_owned()),
             hygiene: "stale_activity=true large=false missing=false".to_owned(),

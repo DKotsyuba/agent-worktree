@@ -90,7 +90,11 @@ fn preview_view(
         key,
         path: path.display().to_string(),
         head: head.clone().unwrap_or_else(|| "unknown".to_owned()),
-        branch: branch.clone().unwrap_or_else(|| "detached".to_owned()),
+        branch: branch
+            .as_deref()
+            .map(response::short_branch)
+            .unwrap_or("detached")
+            .to_owned(),
         disposable: if disposable.is_empty() {
             "(none)".to_owned()
         } else {
@@ -173,7 +177,7 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
                 key: key.clone(),
                 path: format!("{path_text} ({suffix})"),
                 branch: branch
-                    .map(|b| format!("retained ({b})"))
+                    .map(|b| format!("retained ({})", response::short_branch(&b)))
                     .unwrap_or_else(|| "detached".to_owned()),
                 warnings: response::join_warnings(&warnings),
             };
@@ -246,7 +250,7 @@ mod tests {
             status: "COMMITTED",
             key: "0123456789ab/task-1".to_owned(),
             path: "/tmp/w/demo--0123456789ab/task-1 (removed)".to_owned(),
-            branch: "retained (refs/heads/aw/task-1)".to_owned(),
+            branch: "retained (aw/task-1)".to_owned(),
             warnings: None,
         };
         let text = templates()
