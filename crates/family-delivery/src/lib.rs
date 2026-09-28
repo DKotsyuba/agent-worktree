@@ -1,4 +1,7 @@
-//! Immutable local delivery for the single-binary, no-local-state profile.
+//! Immutable local delivery for the single-binary profile, with or without
+//! local state. A release declares the state schema it expects; activation
+//! refuses to run an older schema against newer on-disk state, and never
+//! touches anything outside `<home>/standalone/`.
 //! Hash verification proves integrity, not provenance. Callers authenticate downloads.
 #![forbid(unsafe_code)]
 use fs2::FileExt;
@@ -12,6 +15,9 @@ use std::path::{Path, PathBuf};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// Only one bounded executable and a small manifest are accepted.
 pub const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+/// The product's current on-disk state schema (`state/v1`). Packaging stamps
+/// this into new manifests; keep it in lockstep with the store layout.
+pub const CURRENT_STATE_SCHEMA: u32 = 1;
 
 /// The explicit single-binary profile is separate from the older bundle manifest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,7 +41,7 @@ pub struct Manifest {
     pub size: u64,
     /// SHA-256 of the executable.
     pub sha256: String,
-    /// This installer deliberately supports no local state migration.
+    /// State schema the release expects: 0 = stateless, 1 = `CURRENT_STATE_SCHEMA`.
     pub state_schema: u32,
     /// GitHub run identity, when built there.
     pub run_id: Option<u64>,
@@ -79,7 +85,9 @@ pub fn digest(path: &Path) -> Result<(u64, String)> {
 impl Manifest {
     /// Check owned fields before using any path or identity from the manifest.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 || self.profile != "single-binary-v1" || self.state_schema != 0
+        if self.schema_version != 1
+            || self.profile != "single-binary-v1"
+            || self.state_schema > CURRENT_STATE_SCHEMA
         {
             return Err("unsupported delivery or state profile".into());
         }
@@ -216,9 +224,13 @@ fn activate(base: &Path, manifest: &Manifest, bin_dir: &Path) -> Result<()> {
             return Err("unmanaged current target".into());
         }
         let old = verify(&base.join(previous))?;
-        if old.product != manifest.product || old.target != manifest.target || old.state_schema != 0
-        {
+        if old.product != manifest.product || old.target != manifest.target {
             return Err("incompatible previous installation".into());
+        }
+        // Never run an older state schema against newer on-disk state; same or
+        // newer is fine (newer code reads or migrates the older state).
+        if manifest.state_schema < old.state_schema {
+            return Err("release predates the state schema already in use".into());
         }
     }
     // Preserve executable identity for every new process; it does not repeatedly resolve current.
@@ -299,7 +311,7 @@ pub fn use_version(home: &Path, bin_dir: &Path, version: &str) -> Result<Manifes
 )]
 mod tests {
     use super::*;
-    fn fixture(root: &Path, version: &str) -> PathBuf {
+    fn fixture(root: &Path, version: &str, state_schema: u32) -> PathBuf {
         let binary = root.join(format!("source-{version}"));
         fs::write(&binary, b"fixture, not executable").unwrap();
         let bundle = root.join(format!("bundle-{version}"));
@@ -316,7 +328,7 @@ mod tests {
                 binary: "agent-test-aarch64-apple-darwin".into(),
                 size: 1,
                 sha256: "0".repeat(64),
-                state_schema: 0,
+                state_schema,
                 run_id: None,
                 run_attempt: None,
             },
@@ -328,21 +340,21 @@ mod tests {
     fn verified_bundle() {
         let t = tempfile::tempdir().unwrap();
         assert_eq!(
-            verify(&fixture(t.path(), "0.1.0")).unwrap().version,
+            verify(&fixture(t.path(), "0.1.0", 0)).unwrap().version,
             "0.1.0"
         );
     }
     #[test]
     fn tampered_binary_rejected() {
         let t = tempfile::tempdir().unwrap();
-        let b = fixture(t.path(), "0.1.0");
+        let b = fixture(t.path(), "0.1.0", 0);
         fs::write(b.join("agent-test-aarch64-apple-darwin"), b"tampered").unwrap();
         assert!(verify(&b).is_err());
     }
     #[test]
     fn extra_file_rejected() {
         let t = tempfile::tempdir().unwrap();
-        let b = fixture(t.path(), "0.1.0");
+        let b = fixture(t.path(), "0.1.0", 0);
         fs::write(b.join("extra"), b"x").unwrap();
         assert!(verify(&b).is_err());
     }
@@ -356,7 +368,7 @@ mod tests {
     #[test]
     fn binary_symlink_rejected() {
         let t = tempfile::tempdir().unwrap();
-        let b = fixture(t.path(), "0.1.0");
+        let b = fixture(t.path(), "0.1.0", 0);
         let p = b.join("agent-test-aarch64-apple-darwin");
         fs::remove_file(&p).unwrap();
         std::os::unix::fs::symlink(t.path().join("source-0.1.0"), p).unwrap();
@@ -369,8 +381,8 @@ mod tests {
         let h = t.path().join("home");
         let bin = t.path().join("bin");
         fs::create_dir(&bin).unwrap();
-        let a = fixture(t.path(), "0.1.0");
-        let b = fixture(t.path(), "0.2.0");
+        let a = fixture(t.path(), "0.1.0", 0);
+        let b = fixture(t.path(), "0.2.0", 0);
         install(&a, &h, &bin).unwrap();
         install(&a, &h, &bin).unwrap();
         install(&b, &h, &bin).unwrap();
@@ -382,9 +394,52 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn stateful_upgrade_and_rollback_keep_owner_state_intact() {
+        let t = tempfile::tempdir().unwrap();
+        let h = t.path().join("home");
+        // The owner's pre-existing local state, outside `standalone/`.
+        fs::create_dir_all(h.join("state/v1")).unwrap();
+        fs::write(h.join("config.toml"), b"[storage]\nroot = \"/tmp/wt\"\n").unwrap();
+        fs::write(h.join("state/v1/registry.json"), b"{\"entries\":[]}\n").unwrap();
+        let (config, registry) = (
+            fs::read(h.join("config.toml")).unwrap(),
+            fs::read(h.join("state/v1/registry.json")).unwrap(),
+        );
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        install(&fixture(t.path(), "0.1.0", CURRENT_STATE_SCHEMA), &h, &bin).unwrap();
+        install(&fixture(t.path(), "0.2.0", CURRENT_STATE_SCHEMA), &h, &bin).unwrap();
+        use_version(&h, &bin, "0.1.0").unwrap();
+        assert_eq!(
+            fs::read_link(h.join("standalone/current")).unwrap(),
+            PathBuf::from("releases/0.1.0")
+        );
+        assert_eq!(fs::read(h.join("config.toml")).unwrap(), config);
+        assert_eq!(
+            fs::read(h.join("state/v1/registry.json")).unwrap(),
+            registry
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn older_state_schema_cannot_run_over_newer_state() {
+        let t = tempfile::tempdir().unwrap();
+        let h = t.path().join("home");
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        install(&fixture(t.path(), "0.1.0", CURRENT_STATE_SCHEMA), &h, &bin).unwrap();
+        assert!(install(&fixture(t.path(), "0.2.0", 0), &h, &bin).is_err());
+        assert!(use_version(&h, &bin, "0.2.0").is_err());
+        assert_eq!(
+            fs::read_link(h.join("standalone/current")).unwrap(),
+            PathBuf::from("releases/0.1.0")
+        );
+    }
+    #[cfg(unix)]
+    #[test]
     fn unmanaged_launcher_preserved() {
         let t = tempfile::tempdir().unwrap();
-        let b = fixture(t.path(), "0.1.0");
+        let b = fixture(t.path(), "0.1.0", 0);
         let bin = t.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fs::write(bin.join("agent-test"), b"mine").unwrap();

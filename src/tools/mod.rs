@@ -85,7 +85,11 @@ pub async fn call(
                 result.is_error = Some(true);
                 return Some(result);
             }
-            let reply = identity.identity(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            let reply = identity.identity(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                crate::qualification(),
+            );
             let mut result =
                 CallToolResult::success(vec![ContentBlock::text(reply.text().to_owned())]);
             result.is_error = Some(reply.is_error());

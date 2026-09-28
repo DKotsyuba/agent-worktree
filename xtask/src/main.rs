@@ -485,9 +485,13 @@ impl Project {
             .find_map(|s| s.strip_prefix("host: "))
             .ok_or("host target missing")?
             .to_owned();
-        if self.family["profiles"]["state"].as_str() != Some("none") {
-            return Err("single-binary installer supports the no-local-state starter only".into());
-        }
+        let state_schema = match self.family["profiles"]["state"].as_str() {
+            Some("local") => family_delivery::CURRENT_STATE_SCHEMA,
+            Some("none") => 0,
+            other => {
+                return Err(format!("unsupported state profile for packaging: {other:?}").into());
+            }
+        };
         self.build(true)?;
         let output = self
             .root
@@ -504,7 +508,7 @@ impl Project {
             binary: format!("{}-{target}", self.name),
             size: 1,
             sha256: "0".repeat(64),
-            state_schema: 0,
+            state_schema,
             run_id: std::env::var("GITHUB_RUN_ID")
                 .ok()
                 .and_then(|s| s.parse().ok()),

@@ -208,9 +208,23 @@ The authoritative tool registry is Rust code in `src/tools/mod.rs`;
 `schemas/tools.json` is an exported snapshot, not a load path. Responses are
 rendered from typed views through the embedded MiniJinja renderer in
 `src/response.rs` per `docs/MCP_RESPONSE_STANDARD.md`. The binary includes an
-installer (`self-install`, `releases` subcommands). The release workflow is
-disabled and packaging currently refuses non-`none` state, so until the
-stateful delivery profile lands, installation is from local builds only.
+installer (`self-install`, `releases` subcommands).
+
+### Delivery (local state profile)
+
+`family.toml` declares `profiles.state = "local"`; `cargo xtask package`
+builds the release binary and stamps `state_schema = 1` (the current on-disk
+`state/v1` schema, `family_delivery::CURRENT_STATE_SCHEMA`; `none` packs 0)
+into the `single-binary-v1` bundle next to its SHA-256 manifest. Installing
+(`install.sh --version X.Y.Z` from a GitHub release, or `self-install` on a
+local bundle) writes only under `<home>/standalone/releases/<version>` plus
+the managed launcher in the bin directory: the owner's `config.toml` and
+`state/v1/*` are never deleted, moved or rewritten, and no existing version is
+overwritten. Activation and rollback (`releases use <version>`) verify the
+target bundle and refuse only a downgrade: a release whose `state_schema` is
+lower than the schema already in use by the active release cannot run against
+newer state; same-or-higher is allowed. The release workflow itself stays
+disabled until qualification is reviewed.
 
 ## Module ownership
 

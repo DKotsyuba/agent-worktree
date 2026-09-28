@@ -169,15 +169,21 @@ impl Renderer {
         Ok(Self { env })
     }
 
-    /// Render compile-time product identity, keeping qualification explicit.
+    /// Render compile-time product identity with the family manifest's
+    /// qualification, so the status tool reports the recorded truth.
     #[must_use]
-    pub fn identity(&self, product: &str, version: &str) -> TextReply {
-        let (Ok(product), Ok(version)) = (Reference::new(product), Reference::new(version)) else {
+    pub fn identity(&self, product: &str, version: &str, qualification: &str) -> TextReply {
+        let (Ok(product), Ok(version), Ok(qualification)) = (
+            Reference::new(product),
+            Reference::new(version),
+            Reference::new(qualification),
+        ) else {
             return self.failure(PresentationError::InvalidReference);
         };
         let view = IdentityView {
             product: product.as_str(),
             version: version.as_str(),
+            qualification: qualification.as_str(),
         };
         self.read_reply("status", &view)
     }
@@ -330,6 +336,7 @@ fn read_fallback() -> TextReply {
 struct IdentityView<'a> {
     product: &'a str,
     version: &'a str,
+    qualification: &'a str,
 }
 
 #[derive(Serialize)]

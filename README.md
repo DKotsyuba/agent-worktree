@@ -39,10 +39,27 @@ cargo build --locked        # binary at target/debug/agent-worktree
 cargo build --locked --release
 ```
 
-Release packaging of the local-state profile is not available yet (the release
-workflow is disabled and packaging refuses non-`none` state profiles), so
-installation means pointing your MCP host at a locally built binary. `doctor`
-checks local readiness without side effects:
+Install from a GitHub release (downloads the bundle, verifies every asset
+against the release's `SHA256SUMS`, installs to
+`~/.agent-worktree/standalone/releases/<version>` and manages the launcher
+`~/.local/bin/agent-worktree`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DKotsyuba/agent-worktree/main/install.sh | bash -s -- --version X.Y.Z
+```
+
+Installation, activation and rollback write only under
+`~/.agent-worktree/standalone/`; your `config.toml` and `state/` are never
+touched. Roll back to a retained release with:
+
+```bash
+agent-worktree releases use 0.1.0 --home ~/.agent-worktree --bin-dir ~/.local/bin
+```
+
+A release declares the state schema it expects; activation refuses to run an
+older schema against newer on-disk state, so rollback stops where state
+compatibility would break. `doctor` checks local readiness without side
+effects:
 
 ```bash
 cargo run --locked -- doctor --json

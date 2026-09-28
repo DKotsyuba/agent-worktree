@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## Unreleased
 
 ### Added
 
@@ -15,7 +15,12 @@
 - Safe removal through preview → fingerprint → apply, refusing uncommitted,
   untracked, locked, live, main-worktree and unmerged cases; Git is never
   passed `--force` and branches are always retained.
-- Registration-only prune of missing worktrees, dry run by default.
+- Registration-only prune of missing worktrees, dry run by default, with
+  keyset-paginated previews. There is no TTL: idle or old worktrees and state
+  are never expired or removed automatically.
+- Host notification hook (`agent-worktree hook context`): one context block per
+  worktree idle ≥ 24 h, rate-limited, printing nothing and always exiting 0 so
+  the host is never disrupted.
 - Local state store: atomic revision-checked records and a known-repo registry
   under `~/.agent-worktree/state/v1/`.
 

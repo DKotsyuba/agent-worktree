@@ -48,9 +48,10 @@ publish=false, shared lints. No Python/Node scripting dependencies, no daemon
 or database. Normal MCP text uses strict embedded MiniJinja over small typed
 views; no raw JSON dumping.
 
-The profile is in-process + local state. Release is disabled and packaging
-refuses non-`none` state, so install only from a local build; a stateful
-delivery profile is a separate planned task. Package locally only after
+The profile is in-process + local state. Release is disabled; packaging
+accepts the `local` state profile (state_schema 1) and `none` (0). Install,
+activation and rollback write only under `<home>/standalone/` and never touch
+the owner's `config.toml` or `state/`. Package locally only after
 committing source. Release prepare defaults to preview and never pushes. The
 publisher checks qualification, tag/source/run identity, cargo-deny, no stubs
 and the actual payload. Never flip qualification to make a pipeline green. No

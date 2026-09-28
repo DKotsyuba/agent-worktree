@@ -184,6 +184,24 @@ fn print_json(value: impl serde::Serialize) -> ExitCode {
     }
 }
 
+/// Release qualification recorded in the embedded family manifest, so
+/// `doctor` and `get_status` report the same value the release tooling reads.
+/// An unreadable manifest fails closed to `not_verified`.
+fn qualification() -> &'static str {
+    static QUALIFICATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    QUALIFICATION.get_or_init(|| {
+        toml::from_str::<toml::Value>(include_str!("../family.toml"))
+            .ok()
+            .and_then(|family| {
+                family
+                    .get("qualification")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "not_verified".to_owned())
+    })
+}
+
 /// Prints one `UserPromptSubmit` context envelope, mirroring the shape
 /// `agent-run hook context` emits for both Claude Code and Codex; an empty
 /// `text` prints nothing at all. Write failures (EPIPE) are ignored — the
@@ -262,8 +280,8 @@ async fn main() -> ExitCode {
             let output = print_json(
                 serde_json::json!({"product":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),
                 "home":home.display().to_string(),"config":home.join("config.toml").display().to_string(),
-                "worktree_root":root,"discovery_roots":discovery_roots,
-                "local_ready":ready,"release_qualification":"not_verified","incomplete_tools":tools::incomplete()}),
+                  "worktree_root":root,"discovery_roots":discovery_roots,
+                "local_ready":ready,"release_qualification":qualification(),"incomplete_tools":tools::incomplete()}),
             );
             if ready { output } else { ExitCode::from(2) }
         }

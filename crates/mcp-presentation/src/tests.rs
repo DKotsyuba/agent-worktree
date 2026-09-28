@@ -311,7 +311,7 @@ fn render_output_cap_and_fuel_fail_safely() {
     let mut env = renderer();
     env.env.set_fuel(Some(0));
     assert!(
-        env.identity("agent-example", "0.1.0")
+        env.identity("agent-example", "0.1.0", "not_verified")
             .presentation_degraded()
     );
 }
