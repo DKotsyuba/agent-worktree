@@ -265,14 +265,21 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Returns the episodes in `idle` that are absent from `known`.
+/// Returns the episodes in `idle` that are new relative to `known`.
 ///
-/// An episode is identified by (canonical path, last-activity timestamp): the
-/// same idle stretch never notifies twice, while a later burst of activity
-/// moves the timestamp and starts a fresh episode that notifies again.
+/// A path is announced only when its last-activity timestamp moved past the
+/// recorded one: the same idle stretch never notifies twice, while a later
+/// burst of activity starts a fresh episode that notifies again. A timestamp
+/// that only shrank (reflog expire, gc, restored mtimes) is still the same
+/// episode and stays silent.
 fn new_episodes(known: &[Episode], idle: &[Episode]) -> Vec<Episode> {
     idle.iter()
-        .filter(|episode| !known.contains(episode))
+        .filter(|episode| {
+            known
+                .iter()
+                .find(|recorded| recorded.path == episode.path)
+                .is_none_or(|recorded| episode.last_activity > recorded.last_activity)
+        })
         .cloned()
         .collect()
 }
@@ -287,7 +294,21 @@ fn new_episodes(known: &[Episode], idle: &[Episode]) -> Vec<Episode> {
 /// missing signal — is "unknown, keep": the entry survives so the next scan
 /// cannot re-announce it.
 fn retained_episodes(known: &[Episode], idle: &[Episode], scan: &IdleScan) -> Vec<Episode> {
-    let mut merged = idle.to_vec();
+    // A shrunk timestamp is the same episode: the recorded (newer) entry
+    // stands in for the fresh one, so the stretch cannot re-announce once a
+    // later signal grows past the shrunk value.
+    let mut merged: Vec<Episode> = idle
+        .iter()
+        .map(|fresh| {
+            known
+                .iter()
+                .find(|recorded| {
+                    recorded.path == fresh.path && recorded.last_activity >= fresh.last_activity
+                })
+                .cloned()
+                .unwrap_or_else(|| fresh.clone())
+        })
+        .collect();
     for episode in known {
         if idle.iter().any(|fresh| fresh.path == episode.path) {
             // This scan's episode for the same path supersedes the record.
@@ -429,6 +450,19 @@ mod tests {
         // A different worktree is its own episode.
         let other = vec![episode("task-2", 100)];
         assert_eq!(new_episodes(&first, &other), other);
+    }
+
+    #[test]
+    fn a_shrunk_timestamp_stays_the_same_episode() {
+        let known = vec![episode("task-1", 500)];
+        // The newest signal got older (reflog expire, gc, restored mtimes):
+        // the same idle stretch, no second announcement.
+        let shrink = vec![episode("task-1", 300)];
+        assert!(new_episodes(&known, &shrink).is_empty());
+        assert_eq!(retained_episodes(&known, &shrink, &empty_scan()), known);
+        // Growing back past the recorded timestamp is the next episode.
+        let fresh = vec![episode("task-1", 501)];
+        assert_eq!(new_episodes(&known, &fresh), fresh);
     }
 
     #[test]

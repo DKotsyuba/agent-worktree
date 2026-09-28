@@ -139,12 +139,26 @@ pub struct Layout {
 /// `[discovery] roots` entry expands against the platform home; every
 /// configured path must be absolute after that, and a relative value refuses
 /// resolution with `StoreErrorCode::InvalidConfig`. An absent file means
-/// defaults (no root configured).
+/// defaults (no root configured). An empty platform home reads like an unset
+/// one (the filesystem root stands in), and the resolved home itself must be
+/// absolute — a relative `AGENT_WORKTREE_HOME` is refused rather than
+/// creating state under whatever the current directory happens to be.
 pub fn resolve_layout(
     env_home: Option<PathBuf>,
     platform_home: PathBuf,
 ) -> Result<Layout, StoreError> {
+    let platform_home = if platform_home.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        platform_home
+    };
     let home = env_home.unwrap_or_else(|| platform_home.join(".agent-worktree"));
+    if !home.is_absolute() {
+        return Err(StoreError::new(
+            StoreErrorCode::InvalidConfig,
+            format!("product home must be absolute: {}", home.display()),
+        ));
+    }
     let config = read_config(&home, &platform_home)?;
     Ok(Layout {
         home,
@@ -1076,6 +1090,22 @@ mod tests {
                 .code;
             assert_eq!(code, StoreErrorCode::InvalidConfig, "config {text}");
         }
+    }
+
+    #[test]
+    fn layout_refuses_a_relative_home_and_reads_empty_home_as_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A relative AGENT_WORKTREE_HOME never resolves: state would be
+        // created under whatever the current directory happens to be.
+        let code = resolve_layout(Some(PathBuf::from("rel/home")), tmp.path().to_path_buf())
+            .unwrap_err()
+            .code;
+        assert_eq!(code, StoreErrorCode::InvalidConfig);
+        // An empty HOME behaves like an unset one: the root stands in.
+        assert_eq!(
+            resolve_layout(None, PathBuf::new()).unwrap().home,
+            PathBuf::from("/.agent-worktree")
+        );
     }
 
     #[test]

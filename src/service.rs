@@ -1121,9 +1121,10 @@ impl Service {
         }
         // With its last worktree gone, the per-repository directory under the
         // root is empty; remove it when the removed tree really lived inside
-        // it. The root itself is never a candidate, `std::fs::remove_dir`
-        // refuses non-empty directories (never recursive), and any failure is
-        // a warning, never an error.
+        // it. The root itself is never a candidate, removal is attempted only
+        // on an empty directory (`std::fs::remove_dir` is never recursive),
+        // and a non-empty result — however it got that way — keeps the
+        // directory without a warning; only real failures warn.
         if let Some(root) = &layout.root {
             let repo_dir = root.join(worktree::repo_directory(&scope.label, &scope.repo_id));
             if repo_dir != *root
@@ -1132,7 +1133,9 @@ impl Service {
                 && path
                     .parent()
                     .is_some_and(|parent| canonical_path(parent) == canonical_path(&repo_dir))
+                && std::fs::read_dir(&repo_dir).is_ok_and(|mut entries| entries.next().is_none())
                 && let Err(error) = std::fs::remove_dir(&repo_dir)
+                && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
             {
                 warnings.push(format!("repo_dir_cleanup_failed: {error}"));
             }
