@@ -154,10 +154,15 @@ Interrupted-removal rule: a registered worktree that differs from HEAD only
 through worktree-side deletions of tracked files — no untracked, staged,
 modified, renamed or conflicted entries, ignored leftovers only within
 `disposable_paths` — with HEAD merged into the integration ref (or
-`allow_unmerged`) and no live process, is a half-finished removal this product
-may finish: no `dirty` veto, the warning `resumed_removal`, and apply restores
-the deletions from the index before `git worktree remove`, so Git never needs
-`--force`. Anything else keeps the vetoes above.
+`allow_unmerged`) and no live process, may be a half-finished removal. The
+deletions alone are not evidence (they are equally valid pending work), so
+resuming also requires the record's own `removal_started` marker or the
+fingerprint-bound request flag `resume_interrupted` (the latter is what covers
+foreign worktrees). With evidence there is no `dirty` veto, the warning is
+`resumed_removal`, and apply restores exactly the observed deletion paths from
+the index before `git worktree remove` — never the whole tree — so Git never
+needs `--force`. Without evidence the `dirty` veto stands with a
+`resumable_deletion` hint; everything else keeps the vetoes above.
 
 Git is never passed `--force`, and the branch is always retained (commits are
 never lost). Deletion is permanent; quarantine/trash was rejected because copies

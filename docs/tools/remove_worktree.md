@@ -8,7 +8,8 @@ Removes one worktree — or a batch of up to 20 targets of one repository —
 preview → fingerprint → apply. Git is never passed `--force` and the branch is
 always retained; deletion is permanent. An interrupted apply stays visible
 through the record's `removal_started` marker, and a tree left half-deleted by
-an interrupted removal is resumed, not refused (see below).
+an interrupted removal is resumed once the interruption is evidenced (see
+below).
 
 ## Arguments
 
@@ -23,16 +24,17 @@ Single-target form:
 | `disposable_paths` | no | ≤ 64 relative worktree-relative paths, ≤ 256 bytes each |
 | `allow_unmerged` | no | boolean; explicit consent to remove an unmerged tree |
 | `fingerprint` | apply | the 64-hex fingerprint returned by the preview |
+| `resume_interrupted` | no | boolean; asserts this target's deletions-only changes are an interrupted removal to finish; part of the fingerprint |
 
 Batch form (`targets`, mutually exclusive with `name`, `path`,
-`disposable_paths`, `allow_unmerged` and `fingerprint` — mixing them refuses
-`targets_conflict`):
+`disposable_paths`, `allow_unmerged`, `fingerprint` and `resume_interrupted` —
+mixing them refuses `targets_conflict`):
 
 | Field | Required | Notes |
 |---|---|---|
 | `repo` | yes | the one repository every target belongs to; a target registered in another repository is reported as `refused not_found` on its line |
 | `mode` | yes | `preview` or `apply`, for every target |
-| `targets` | yes | 1–20 items, each `{ "name"? | "path"?, "disposable_paths"?, "allow_unmerged"?, "fingerprint"? }` (exactly one of name/path per item; empty or over-20 batches refuse `targets_invalid`) |
+| `targets` | yes | 1–20 items, each `{ "name"? | "path"?, "disposable_paths"?, "allow_unmerged"?, "fingerprint"?, "resume_interrupted"? }` (exactly one of name/path per item; empty or over-20 batches refuse `targets_invalid`) |
 
 ## Preview
 
@@ -46,7 +48,11 @@ not an execution error; apply is only meaningful when eligible.
 A batch preview returns one compact line per target — key, path, head, branch,
 `eligible`, `vetoes`, `warnings`, `fingerprint` — plus
 `Summary: eligible=N refused=M`. A target that cannot be resolved shows its
-stable refusal code (for example `not_found`) in the `vetoes` field.
+stable refusal code (for example `not_found`) in the `vetoes` field. The exact
+rendered size is checked against the 8 KiB page budget: a preview that cannot
+fit whole is refused as `batch_too_large` (no effect happened) instead of being
+truncated or degraded, and if the template itself fails, the complete page is
+rendered from Rust so every row stays visible.
 
 ## Apply
 
@@ -76,9 +82,11 @@ stops, hides or rolls back the others. The receipt carries one line per target
 `outcome_unknown <path>` — plus `Summary: removed=N refused=M unknown=K`.
 Refused lines are the requested answer, so a mixed batch is not an execution
 error; any `outcome_unknown` line makes the reply an error, because it demands
-reconciliation. If even a conservative estimate of the per-target lines cannot
-fit the 8 KiB page budget, the whole batch is refused as `batch_too_large`
-before any effect, suggesting a smaller batch.
+reconciliation. When a bound of the receipt lines computed from the arguments
+cannot fit the 8 KiB page budget, the whole batch is refused as
+`batch_too_large` before any effect (the bound covers the removed, absent and
+refused lines; the rare `outcome_unknown` line with a long resolved path is
+carried complete by the Rust-rendered receipt fallback rather than hidden).
 
 ## Deadline and never killing an in-flight removal
 
@@ -88,7 +96,9 @@ Git call; in a batch the deadline applies per target). A dispatched mutation is
 never killed by that deadline: on timeout the Git process is detached, finishes
 in the background and is reaped, and the reply is `OUTCOME_UNKNOWN` naming the
 path and saying the removal may still be running. Read-only probes keep
-kill-on-timeout. This is what keeps a large tree from being left half-deleted
+kill-on-timeout, and a read-phase failure before dispatch (for example the
+pre-dispatch inventory) is reported as the read failure it is, never as an
+unknown effect. This is what keeps a large tree from being left half-deleted
 by the budget itself.
 
 ## Interrupted-removal rule
@@ -97,10 +107,21 @@ If a registered worktree differs from HEAD only through deletions of tracked
 files (status v2: every entry is a worktree-side deletion; no untracked,
 staged, modified, renamed or conflicted entries; ignored leftovers allowed only
 within `disposable_paths` as today), HEAD is merged into the integration ref
-(or `allow_unmerged` is set) and no live process occupies the tree, there is no
-`dirty` veto: the preview reports the warning `resumed_removal` and apply
-finishes the removal — the deletions are restored from the index first so Git
-needs no `--force`. Anything else keeps today's vetoes unchanged.
+(or `allow_unmerged` is set) and no live process occupies the tree, the tree
+MAY be a half-finished removal — but deletions alone are not evidence, they are
+equally valid pending work. Resuming additionally requires explicit evidence:
+
+- the record's own `removal_started` marker (our interrupted apply), or
+- the request flag `resume_interrupted: true` — needed for foreign worktrees,
+  which have no record.
+
+With evidence there is no `dirty` veto: the preview reports the warning
+`resumed_removal` and apply finishes the removal, restoring exactly the
+observed deletion paths from the index (never the whole tree, so a concurrent
+edit cannot be reset) so Git needs no `--force`. Without evidence the `dirty`
+veto stands and the preview adds the warning `resumable_deletion` naming the
+flag. The flag is part of the fingerprint: a preview taken with it applies only
+under the same flag. Anything else keeps today's vetoes unchanged.
 
 ## Refusals (`ERROR …`, no effect)
 

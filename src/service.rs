@@ -161,9 +161,15 @@ fn git_read_error(error: GitError) -> ServiceError {
 }
 
 /// Maps a Git failure after a mutation may have been dispatched.
+///
+/// Only `OutcomeUnknown` is treated as an uncertain effect: dispatched
+/// mutations are detached on timeout and report exactly that code, so a plain
+/// `Timeout` can only come from a read-phase call inside the mutation (for
+/// example the pre-dispatch inventory in `git::remove`) and maps as a read —
+/// no effect was dispatched.
 fn git_mutation_error(error: GitError, target: &str, path: &Path) -> ServiceError {
     match error.code {
-        GitErrorCode::Timeout | GitErrorCode::OutcomeUnknown => ServiceError::outcome_unknown(
+        GitErrorCode::OutcomeUnknown => ServiceError::outcome_unknown(
             error.code.as_str(),
             target,
             path,
@@ -1150,6 +1156,7 @@ impl Service {
             expected_fingerprint: None,
             disposable_paths: item.disposable.clone(),
             allow_unmerged: item.allow_unmerged,
+            resume_interrupted: item.resume_interrupted,
         };
         if mode == RemoveMode::Preview {
             let observation = git::observe(
@@ -1199,6 +1206,7 @@ impl Service {
             expected_fingerprint: Some(fingerprint),
             disposable_paths: item.disposable.clone(),
             allow_unmerged: item.allow_unmerged,
+            resume_interrupted: item.resume_interrupted,
         };
         let decision =
             worktree::assess_removal(&observation, record.as_ref(), &request, &self.policy);
@@ -1234,11 +1242,22 @@ impl Service {
 
         let branch = target.branch.clone();
         let path = target.path.clone();
-        // An interrupted removal assessed as deletions-only is resumed: the
-        // deletions are restored from the index inside `git::remove` so Git
-        // accepts the removal without `--force`.
-        let resume_interrupted = decision.warnings.contains(&Warning::ResumedRemoval);
-        let removed = git::remove(&scope.common_dir, &path, resume_interrupted, &op_budget)
+        // An interrupted removal assessed with evidence is resumed: exactly
+        // the observed deletion paths are restored from the index inside
+        // `git::remove`, so Git accepts the removal without `--force` and no
+        // other tracked file is ever reset.
+        let resume_deleted = if decision.warnings.contains(&Warning::ResumedRemoval) {
+            match &observation.status {
+                worktree::Probe::Known(facts)
+                | worktree::Probe::Incomplete {
+                    evidence: facts, ..
+                } => facts.deleted_paths.clone(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let removed = git::remove(&scope.common_dir, &path, &resume_deleted, &op_budget)
             .await
             .map_err(|e| git_mutation_error(e, &format!("remove_worktree {key}"), &path))?;
         // The effect is confirmed past this point; cleanup problems are warnings.
@@ -2209,6 +2228,10 @@ pub struct RemoveArgs {
     pub allow_unmerged: Option<bool>,
     /// Fingerprint returned by the preview being applied (single-target form).
     pub fingerprint: Option<String>,
+    /// Explicit assertion that this target's deletions-only tracked changes
+    /// are an interrupted removal to finish (single-target form); part of the
+    /// fingerprint.
+    pub resume_interrupted: Option<bool>,
     /// Batch form: 1–[`MAX_REMOVE_TARGETS`] targets removed in one call,
     /// mutually exclusive with the single-target fields above.
     pub targets: Option<Vec<RemoveTargetArgs>>,
@@ -2228,6 +2251,9 @@ pub struct RemoveTargetArgs {
     pub allow_unmerged: Option<bool>,
     /// Fingerprint returned by this target's preview; required for apply.
     pub fingerprint: Option<String>,
+    /// Explicit assertion that this target's deletions-only tracked changes
+    /// are an interrupted removal to finish; part of the fingerprint.
+    pub resume_interrupted: Option<bool>,
 }
 
 impl RemoveTargetArgs {
@@ -2249,6 +2275,9 @@ struct RemoveItem {
     disposable: Vec<PathBuf>,
     /// Explicit confirmation allowing removal of an unmerged worktree.
     allow_unmerged: bool,
+    /// Explicit assertion that deletions-only changes are an interrupted
+    /// removal to finish (evidence a record's `removal_started` also gives).
+    resume_interrupted: bool,
     /// Apply only: the expected preview fingerprint, already parsed.
     fingerprint: Option<Fingerprint>,
 }
@@ -2292,6 +2321,7 @@ fn normalize_remove_items(
             path: args.path.clone(),
             disposable: validate_disposable(args.disposable_paths.as_deref().unwrap_or(&[]))?,
             allow_unmerged: args.allow_unmerged.unwrap_or(false),
+            resume_interrupted: args.resume_interrupted.unwrap_or(false),
             fingerprint: parse_fingerprint(args.fingerprint.as_deref())?,
         }]);
     };
@@ -2301,11 +2331,12 @@ fn normalize_remove_items(
         || args.disposable_paths.is_some()
         || args.allow_unmerged.is_some()
         || args.fingerprint.is_some()
+        || args.resume_interrupted.is_some()
     {
         return Err(ServiceError::blocked(
             "targets_conflict",
             "targets cannot be combined with name, path, disposable_paths, \
-             allow_unmerged or fingerprint",
+             allow_unmerged, fingerprint or resume_interrupted",
         ));
     }
     if targets.is_empty() || targets.len() > MAX_REMOVE_TARGETS {
@@ -2314,20 +2345,29 @@ fn normalize_remove_items(
             format!("targets must contain between 1 and {MAX_REMOVE_TARGETS} entries"),
         ));
     }
-    // A batch reply is one compact line per target inside the page budget and
-    // is never truncated: refuse up front when even a conservative estimate
-    // cannot fit, before any effect is considered.
-    let estimate = 128
-        + targets
-            .iter()
-            .map(|target| target.identity().len() + REMOVE_BATCH_LINE_FURNITURE)
-            .sum::<usize>();
-    if estimate > REMOVE_BATCH_PAGE_BUDGET {
-        return Err(ServiceError::blocked(
-            "batch_too_large",
-            "the batch reply cannot fit the 8 KiB page budget without truncation",
-        )
-        .with_next("retry with a smaller batch, or one remove_worktree call per target"));
+    // An apply receipt is one compact line per target inside the page budget
+    // and is never truncated: refuse up front when a bound of those lines
+    // cannot fit, before any effect is dispatched. The bound covers the
+    // removed/already_absent lines exactly and the refused lines through their
+    // 240-byte render cap; the one line that can exceed it is
+    // `outcome_unknown <path>`, whose resolved path is not known from the
+    // arguments alone for name-addressed targets — that pathological case is
+    // carried complete by the Rust-rendered receipt fallback instead of being
+    // hidden or truncated. Preview needs no pre-dispatch bound: it has no
+    // effects and the tools layer checks the exact rendered size.
+    if mode == RemoveMode::Apply {
+        let estimate = 128
+            + targets
+                .iter()
+                .map(|target| target.identity().len() + REMOVE_BATCH_LINE_FURNITURE)
+                .sum::<usize>();
+        if estimate > REMOVE_BATCH_PAGE_BUDGET {
+            return Err(ServiceError::blocked(
+                "batch_too_large",
+                "the apply receipt cannot fit the 8 KiB page budget without truncation",
+            )
+            .with_next("retry with a smaller batch, or one remove_worktree call per target"));
+        }
     }
     let mut items = Vec::with_capacity(targets.len());
     for (index, target) in targets.iter().enumerate() {
@@ -2353,6 +2393,7 @@ fn normalize_remove_items(
             path: target.path.clone(),
             disposable: validate_disposable(target.disposable_paths.as_deref().unwrap_or(&[]))?,
             allow_unmerged: target.allow_unmerged.unwrap_or(false),
+            resume_interrupted: target.resume_interrupted.unwrap_or(false),
             fingerprint: parse_fingerprint(target.fingerprint.as_deref())?,
         });
     }
@@ -3037,6 +3078,27 @@ mod tests {
         assert!(validate_disposable(&["/abs".to_owned()]).is_err());
         assert!(validate_disposable(&["../up".to_owned()]).is_err());
         assert!(validate_disposable(&["".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn mutation_error_mapping_keeps_timeouts_read_only() {
+        let path = Path::new("/w/task-1");
+        // A dispatched mutation reports an uncertain effect.
+        let unknown = git_mutation_error(
+            GitError::new(GitErrorCode::OutcomeUnknown, "detached"),
+            "remove_worktree ab/task-1",
+            path,
+        );
+        assert_eq!(unknown.outcome, ServiceOutcome::OutcomeUnknown);
+        // A read-phase timeout inside a mutation call dispatched nothing:
+        // it maps as a read failure, never as an unknown effect.
+        let timeout = git_mutation_error(
+            GitError::new(GitErrorCode::Timeout, "pre-dispatch inventory"),
+            "remove_worktree ab/task-1",
+            path,
+        );
+        assert_eq!(timeout.outcome, ServiceOutcome::Unavailable);
+        assert_eq!(timeout.code, "timeout");
     }
 
     #[test]

@@ -306,6 +306,7 @@ mod tests {
                 ignored: vec!["target/".to_owned()],
                 digest: "cafe01".to_owned(),
                 worktree_deletions_only: false,
+                deleted_paths: Vec::new(),
             }),
             submodules: Probe::NotChecked,
             integration: Probe::Known(Integration::Unmerged),

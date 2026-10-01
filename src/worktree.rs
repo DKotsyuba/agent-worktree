@@ -274,6 +274,11 @@ pub struct StatusFacts {
     /// conflicted. This is the signature of an interrupted removal, which a
     /// merged and unoccupied tree may resume.
     pub worktree_deletions_only: bool,
+    /// Paths of the `1 .D` worktree-side deletions, so a resumed removal can
+    /// restore exactly those files and never reset the whole tree. Lossily
+    /// UTF-8 (like every status path here); a non-UTF-8 deletion simply fails
+    /// the restore instead of resuming.
+    pub deleted_paths: Vec<String>,
 }
 
 /// Submodule observation used by removal vetoes.
@@ -381,7 +386,6 @@ impl Fingerprint {
     }
 }
 
-/// Inputs to `fingerprint`; every field is part of the hash.
 #[derive(Clone, Copy)]
 pub struct FingerprintInput<'a> {
     /// Canonical absolute worktree path.
@@ -398,6 +402,9 @@ pub struct FingerprintInput<'a> {
     pub record_revision: u64,
     /// Policy revision at preview time.
     pub policy_revision: u64,
+    /// Whether the request asserts `resume_interrupted`: a preview taken with
+    /// the flag only applies under the same flag.
+    pub resume_interrupted: bool,
 }
 
 /// Computes the removal fingerprint over a versioned, length-prefixed encoding of all inputs.
@@ -425,6 +432,10 @@ pub fn fingerprint(input: &FingerprintInput<'_>) -> Fingerprint {
     }
     hasher.update(input.record_revision.to_le_bytes());
     hasher.update(input.policy_revision.to_le_bytes());
+    hash_field(
+        &mut hasher,
+        if input.resume_interrupted { b"1" } else { b"0" },
+    );
     Fingerprint(hex(&hasher.finalize()))
 }
 
@@ -508,6 +519,10 @@ pub enum Warning {
     },
     /// The record shows a dispatched removal that never completed.
     RemovalStarted,
+    /// The tree differs from HEAD only through worktree-side deletions and
+    /// the removal was refused as dirty for want of interrupted-removal
+    /// evidence; `resume_interrupted` on the request supplies it.
+    ResumableDeletion,
     /// The tree differs from HEAD only through worktree-side deletions, the
     /// signature of an interrupted removal; apply may finish the removal.
     ResumedRemoval,
@@ -525,6 +540,11 @@ pub struct RemovalRequest {
     pub disposable_paths: Vec<PathBuf>,
     /// Explicit confirmation allowing removal of an unmerged worktree; the branch is retained.
     pub allow_unmerged: bool,
+    /// Explicit assertion that deletions-only tracked changes are an
+    /// interrupted removal to finish, not pending work; part of the
+    /// fingerprint. Automatic evidence (a `removal_started` record) also
+    /// suffices, which is why foreign worktrees need this flag.
+    pub resume_interrupted: bool,
 }
 
 /// Blocking result of removal assessment.
@@ -738,11 +758,19 @@ pub fn assess_removal(
         // Interrupted-removal rule: a registered tree that differs from HEAD
         // only through worktree-side deletions — nothing staged, modified,
         // renamed, untracked or conflicted, ignored leftovers still bound to
-        // the approved disposable paths below — is a half-finished removal
-        // this tool may finish, provided HEAD is merged (or explicitly
-        // allowed) and no live process occupies the tree. Anything else keeps
-        // today's `dirty` veto.
+        // the approved disposable paths below — MAY be a half-finished removal
+        // this tool can finish, provided HEAD is merged (or explicitly
+        // allowed) and no live process occupies the tree. Deletions alone are
+        // not evidence: they are equally valid pending work, so the resume
+        // also requires explicit evidence — the record's own `removal_started`
+        // marker (our interrupted apply) or the request flag
+        // `resume_interrupted` (needed for foreign worktrees, which have no
+        // record). Without evidence the `dirty` veto stands and the hint
+        // below names the flag.
+        let resume_evidence =
+            request.resume_interrupted || record.is_some_and(|r| r.removal_started.is_some());
         let resumed_removal = facts.worktree_deletions_only
+            && resume_evidence
             && probe_value(&observation.live_processes).copied() != Some(true)
             && (request.allow_unmerged
                 || probe_value(&observation.integration).copied()
@@ -752,6 +780,9 @@ pub fn assess_removal(
                 warnings.push(Warning::ResumedRemoval);
             } else {
                 vetoes.push(Veto::Dirty);
+                if facts.worktree_deletions_only && !resume_evidence {
+                    warnings.push(Warning::ResumableDeletion);
+                }
             }
         }
         if facts.untracked > 0 {
@@ -810,6 +841,7 @@ pub fn assess_removal(
             disposable_paths: &request.disposable_paths,
             record_revision: record.map_or(0, |r| r.revision),
             policy_revision: policy.revision,
+            resume_interrupted: request.resume_interrupted,
         })
     });
     if let (Some(expected), Some(actual)) = (&request.expected_fingerprint, &current)
@@ -992,6 +1024,7 @@ mod tests {
             disposable_paths: disposable,
             record_revision,
             policy_revision,
+            resume_interrupted: false,
         })
     }
 
@@ -1044,6 +1077,7 @@ mod tests {
                 ignored: Vec::new(),
                 digest: "cafe01".to_owned(),
                 worktree_deletions_only: false,
+                deleted_paths: Vec::new(),
             }),
             submodules: Probe::Known(SubmoduleFacts {
                 dirty: false,
@@ -1107,6 +1141,7 @@ mod tests {
             disposable_paths: &request.disposable_paths,
             record_revision: record.map_or(0, |r| r.revision),
             policy_revision: Policy::default().revision,
+            resume_interrupted: request.resume_interrupted,
         })
     }
 
@@ -1245,6 +1280,7 @@ mod tests {
                     ignored: Vec::new(),
                     digest: "cafe01".to_owned(),
                     worktree_deletions_only: false,
+                    deleted_paths: Vec::new(),
                 },
                 reason: "output cap hit".to_owned(),
             }
@@ -1429,6 +1465,7 @@ mod tests {
                             ignored: Vec::new(),
                             digest: "cafe01".to_owned(),
                             worktree_deletions_only: false,
+                            deleted_paths: Vec::new(),
                         },
                         reason: "output cap hit".to_owned(),
                     }
@@ -1570,6 +1607,7 @@ mod tests {
                     ignored: Vec::new(),
                     digest: "cafe01".to_owned(),
                     worktree_deletions_only: false,
+                    deleted_paths: Vec::new(),
                 },
                 reason: "output cap hit".to_owned(),
             }
@@ -1614,18 +1652,56 @@ mod tests {
             facts.unstaged = 2;
             facts.worktree_deletions_only = true;
         });
-        // Deletions only, merged and unoccupied: eligible with the warning.
+        let flagged = RemovalRequest {
+            resume_interrupted: true,
+            ..RemovalRequest::default()
+        };
+        let mut crashed = sample_record();
+        crashed.removal_started = Some(RemovalStarted {
+            fingerprint: Fingerprint::parse(&"0".repeat(64)).unwrap(),
+            at: 999,
+        });
+
+        // Deletions alone are not evidence: without the flag or a
+        // removal_started record the dirty veto stands, with the hint.
         let decision = assess_removal(&deletions, None, &RemovalRequest::default(), &policy);
+        assert!(
+            decision.vetoes.contains(&Veto::Dirty),
+            "{:?}",
+            decision.vetoes
+        );
+        assert!(!decision.warnings.contains(&Warning::ResumedRemoval));
+        assert!(decision.warnings.contains(&Warning::ResumableDeletion));
+
+        // The explicit flag resumes (foreign worktrees have no record).
+        let decision = assess_removal(&deletions, None, &flagged, &policy);
         assert!(decision.vetoes.is_empty(), "{:?}", decision.vetoes);
         assert!(decision.warnings.contains(&Warning::ResumedRemoval));
+        assert!(!decision.warnings.contains(&Warning::ResumableDeletion));
 
-        // Deletions plus one modification: today's dirty veto.
+        // Our own interrupted apply (removal_started record) resumes alone.
+        let decision = assess_removal(
+            &deletions,
+            Some(&crashed),
+            &RemovalRequest::default(),
+            &policy,
+        );
+        assert!(decision.vetoes.is_empty(), "{:?}", decision.vetoes);
+        assert!(decision.warnings.contains(&Warning::ResumedRemoval));
+        assert!(decision.warnings.contains(&Warning::RemovalStarted));
+
+        // Deletions plus one modification: the dirty veto, no hint (the
+        // deletions-only signature is what makes the hint truthful).
         let modified = with_status(&clean_observation(), |facts| {
             facts.unstaged = 3;
         });
         let decision = assess_removal(&modified, None, &RemovalRequest::default(), &policy);
         assert!(decision.vetoes.contains(&Veto::Dirty));
         assert!(!decision.warnings.contains(&Warning::ResumedRemoval));
+        assert!(!decision.warnings.contains(&Warning::ResumableDeletion));
+        // Even with the flag, a modification is pending work, not a resume.
+        let decision = assess_removal(&modified, None, &flagged, &policy);
+        assert!(decision.vetoes.contains(&Veto::Dirty));
 
         // Deletions plus an untracked file: the untracked veto, no resume.
         let untracked = with_status(&deletions, |facts| {
@@ -1641,13 +1717,14 @@ mod tests {
         let unmerged = with(&deletions, |o| {
             o.integration = Probe::Known(Integration::Unmerged)
         });
-        let decision = assess_removal(&unmerged, None, &RemovalRequest::default(), &policy);
+        let decision = assess_removal(&unmerged, None, &flagged, &policy);
         assert!(decision.vetoes.contains(&Veto::Dirty));
         assert!(decision.vetoes.contains(&Veto::Unmerged));
         assert!(!decision.warnings.contains(&Warning::ResumedRemoval));
         // … unless the request explicitly allows unmerged.
         let allowed = RemovalRequest {
             allow_unmerged: true,
+            resume_interrupted: true,
             ..RemovalRequest::default()
         };
         let decision = assess_removal(&unmerged, None, &allowed, &policy);
@@ -1656,7 +1733,7 @@ mod tests {
 
         // A live process keeps the deletions dirty.
         let occupied = with(&deletions, |o| o.live_processes = Probe::Known(true));
-        let decision = assess_removal(&occupied, None, &RemovalRequest::default(), &policy);
+        let decision = assess_removal(&occupied, None, &flagged, &policy);
         assert!(decision.vetoes.contains(&Veto::Dirty));
         assert!(decision.vetoes.contains(&Veto::LiveProcess));
         assert!(!decision.warnings.contains(&Warning::ResumedRemoval));

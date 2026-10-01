@@ -24,7 +24,7 @@ pub const BATCH_RECEIPT_TEMPLATE: &str =
     include_str!("../../assets/mcp/tools/remove_worktree_batch_receipt.txt.j2");
 
 /// Argument hint used in invalid-arguments refusals.
-const ARGS: &str = "Accepted fields: repo, name?|path?, mode (preview|apply), disposable_paths?, allow_unmerged?, fingerprint? (apply); or repo, mode and targets (1-20 items of name?|path?, disposable_paths?, allow_unmerged?, fingerprint?) instead of the single-target fields.";
+const ARGS: &str = "Accepted fields: repo, name?|path?, mode (preview|apply), disposable_paths?, allow_unmerged?, fingerprint? (apply), resume_interrupted?; or repo, mode and targets (1-20 items of name?|path?, disposable_paths?, allow_unmerged?, fingerprint?, resume_interrupted?) instead of the single-target fields.";
 
 /// Typed preview view rendered by the embedded template.
 #[derive(Serialize)]
@@ -224,16 +224,60 @@ fn batch_preview_row(row: &service::BatchPreviewRow) -> BatchPreviewRowView {
     }
 }
 
-/// Outcome text of one batch apply line.
+/// Outcome text of one batch apply line; the refused codes are bounded to
+/// keep the receipt inside the pre-checked page budget.
 fn batch_outcome_text(kind: &service::BatchApplyKind) -> String {
     match kind {
         service::BatchApplyKind::Removed => "removed".to_owned(),
         service::BatchApplyKind::AlreadyAbsent => "already_absent".to_owned(),
-        service::BatchApplyKind::Refused(codes) => format!("refused {codes}"),
+        service::BatchApplyKind::Refused(codes) => {
+            format!("refused {}", response::bounded(codes, 240))
+        }
         service::BatchApplyKind::OutcomeUnknown { path } => format!(
             "outcome_unknown {path} (the removal may still be running; inspect before any retry)"
         ),
     }
+}
+
+/// Renders one batch preview line exactly as the template lays it out; the
+/// single source for the exact page-budget check and the Rust fallback.
+fn batch_preview_line(row: &BatchPreviewRowView) -> String {
+    format!(
+        "{} | {} | head={} | branch={} | eligible={} | vetoes={} | warnings={} | fingerprint={}",
+        row.key,
+        row.path,
+        row.head,
+        row.branch,
+        row.eligible,
+        row.vetoes,
+        row.warnings,
+        row.fingerprint
+    )
+}
+
+/// Exact byte size of the batch preview page as it will be rendered.
+fn batch_preview_bytes(rows: &[BatchPreviewRowView], eligible: usize, refused: usize) -> usize {
+    let mut size = format!("PREVIEW remove_worktree batch: {} target(s)\n", rows.len()).len();
+    for row in rows {
+        size += batch_preview_line(row).len() + 1;
+    }
+    size += format!("Summary: eligible={eligible} refused={refused}\n").len();
+    size
+}
+
+/// Rust-side complete batch preview page used when the template fails; the
+/// observation already happened, so every row stays visible.
+fn batch_preview_fallback(rows: &[BatchPreviewRowView], eligible: usize, refused: usize) -> String {
+    let mut text = format!("PREVIEW remove_worktree batch: {} target(s)\n", rows.len());
+    for row in rows {
+        text.push_str(&batch_preview_line(row));
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "Summary: eligible={eligible} refused={refused}\n\
+Presentation: degraded (presentation_failed).\n"
+    ));
+    text
 }
 
 /// Rust-side batch receipt used when the template fails after a batch ran.
@@ -264,7 +308,7 @@ Do not repeat the removal to repair this response.\n"
 
 pub fn definition() -> Value {
     json!({"name":"remove_worktree",
-        "description":"Remove one worktree, or a batch of up to 20 targets of one repository. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. A tree left half-deleted by an interrupted removal (tracked-file deletions only) is resumed, not refused. An interrupted apply stays visible through the record's removal_started marker.",
+        "description":"Remove one worktree, or a batch of up to 20 targets of one repository. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. A tree left half-deleted by an interrupted removal (tracked-file deletions only) is resumed when the record shows our own interrupted apply, or when resume_interrupted explicitly says so. An interrupted apply stays visible through the record's removal_started marker.",
         "inputSchema":{"type":"object","required":["repo","mode"],
             "properties":{
                 "repo":{"type":"string","description":"Repository root or any worktree inside it; the single repository every target belongs to."},
@@ -274,12 +318,14 @@ pub fn definition() -> Value {
                 "disposable_paths":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":256},"description":"Ignored paths approved for deletion, worktree-relative (for example target/)."},
                 "allow_unmerged":{"type":"boolean","description":"Explicitly allow removing an unmerged worktree; the branch is retained."},
                 "fingerprint":{"type":"string","maxLength":64,"description":"Fingerprint returned by the preview being applied; required for apply."},
-                "targets":{"type":"array","minItems":1,"maxItems":20,"description":"Batch form: 1-20 targets removed in one call, all in repo. Mutually exclusive with name, path, disposable_paths, allow_unmerged and fingerprint.","items":{"type":"object","required":[],"properties":{
+                "resume_interrupted":{"type":"boolean","description":"Assert this target's deletions-only tracked changes are an interrupted removal to finish, restoring exactly those files; part of the fingerprint. Automatic when the record has removal_started."},
+                "targets":{"type":"array","minItems":1,"maxItems":20,"description":"Batch form: 1-20 targets removed in one call, all in repo. Mutually exclusive with name, path, disposable_paths, allow_unmerged, fingerprint and resume_interrupted.","items":{"type":"object","required":[],"properties":{
                     "name":{"type":"string","maxLength":64,"description":"Worktree directory name; provide exactly one of name or path."},
                     "path":{"type":"string","maxLength":1024,"description":"Absolute worktree path; provide exactly one of name or path."},
                     "disposable_paths":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":256},"description":"Ignored paths approved for this target's deletion, worktree-relative."},
                     "allow_unmerged":{"type":"boolean","description":"Explicitly allow removing this unmerged worktree; the branch is retained."},
-                    "fingerprint":{"type":"string","maxLength":64,"description":"Fingerprint returned by this target's preview; required for apply."}},
+                    "fingerprint":{"type":"string","maxLength":64,"description":"Fingerprint returned by this target's preview; required for apply."},
+                    "resume_interrupted":{"type":"boolean","description":"Assert this target's deletions-only tracked changes are an interrupted removal to finish; part of the fingerprint."}},
                     "additionalProperties":false}}},
             "additionalProperties":false},
         "annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}})
@@ -333,6 +379,18 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
         Ok(RemoveOutcome::BatchPreview { rows, eligible }) => {
             let views = rows.iter().map(batch_preview_row).collect::<Vec<_>>();
             let refused = views.len().saturating_sub(eligible);
+            // The exact rendered size is a true bound (it is the render): a
+            // preview that cannot fit the page budget is refused with a clear
+            // code instead of degrading into a row-less fallback. No effect
+            // happened, so refusing after the observation is safe.
+            if batch_preview_bytes(&views, eligible, refused) > Class::Page.bytes() {
+                let error = service::ServiceError::blocked(
+                    "batch_too_large",
+                    "the batch preview cannot fit the 8 KiB page budget without truncation",
+                )
+                .with_next("retry with a smaller batch, or one remove_worktree call per target");
+                return response::failure(templates, &error);
+            }
             let view = BatchPreviewView {
                 count: views.len(),
                 rows: views,
@@ -341,7 +399,12 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
             };
             match templates.render("remove_worktree_batch", &view, Class::Page) {
                 Ok(text) => response::text_result(text, false),
-                Err(_) => response::text_result(response::READ_FALLBACK.to_owned(), true),
+                // The observation already happened: the complete Rust page
+                // keeps every row visible instead of a generic read fallback.
+                Err(_) => response::text_result(
+                    batch_preview_fallback(&view.rows, eligible, refused),
+                    false,
+                ),
             }
         }
         Ok(RemoveOutcome::BatchApplied {
@@ -711,6 +774,36 @@ mod tests {
         assert!(text.contains("ab12/task-2 | outcome_unknown /w/task-2"));
         assert!(text.contains("Summary: removed=1 refused=0 unknown=1"));
         assert!(text.contains("Do not repeat the removal"));
+    }
+
+    #[test]
+    fn batch_preview_fallback_keeps_every_row() {
+        let fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let row = |key: &str, eligible: bool, vetoes: &str| BatchPreviewRowView {
+            key: key.to_owned(),
+            path: format!("/w/{}", key),
+            head: "0f1e".to_owned(),
+            branch: format!("aw/{}", key),
+            eligible,
+            vetoes: vetoes.to_owned(),
+            warnings: "-".to_owned(),
+            fingerprint: fingerprint.to_owned(),
+        };
+        let rows = vec![
+            row("ab12/task-1", true, "-"),
+            row("ab12/task-2", false, "untracked_files"),
+        ];
+        let text = batch_preview_fallback(&rows, 1, 1);
+        assert!(text.starts_with("PREVIEW remove_worktree batch: 2 target(s)\n"));
+        assert!(text.contains("/task-1 | /w/ab12/task-1 | head=0f1e"));
+        assert!(text.contains("eligible=true | vetoes=-"));
+        assert!(text.contains("eligible=false | vetoes=untracked_files"));
+        assert!(text.ends_with(
+            "Summary: eligible=1 refused=1\nPresentation: degraded (presentation_failed).\n"
+        ));
+        // The exact byte count of the rendered page matches the checker.
+        let degraded_note = "Presentation: degraded (presentation_failed).\n".len();
+        assert_eq!(batch_preview_bytes(&rows, 1, 1), text.len() - degraded_note);
     }
 
     #[test]

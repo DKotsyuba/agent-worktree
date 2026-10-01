@@ -173,7 +173,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Remove one worktree, or a batch of up to 20 targets of one repository. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. A tree left half-deleted by an interrupted removal (tracked-file deletions only) is resumed, not refused. An interrupted apply stays visible through the record's removal_started marker.",
+    "description": "Remove one worktree, or a batch of up to 20 targets of one repository. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. A tree left half-deleted by an interrupted removal (tracked-file deletions only) is resumed when the record shows our own interrupted apply, or when resume_interrupted explicitly says so. An interrupted apply stays visible through the record's removal_started marker.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -215,8 +215,12 @@
           "description": "Repository root or any worktree inside it; the single repository every target belongs to.",
           "type": "string"
         },
+        "resume_interrupted": {
+          "description": "Assert this target's deletions-only tracked changes are an interrupted removal to finish, restoring exactly those files; part of the fingerprint. Automatic when the record has removal_started.",
+          "type": "boolean"
+        },
         "targets": {
-          "description": "Batch form: 1-20 targets removed in one call, all in repo. Mutually exclusive with name, path, disposable_paths, allow_unmerged and fingerprint.",
+          "description": "Batch form: 1-20 targets removed in one call, all in repo. Mutually exclusive with name, path, disposable_paths, allow_unmerged, fingerprint and resume_interrupted.",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -247,6 +251,10 @@
                 "description": "Absolute worktree path; provide exactly one of name or path.",
                 "maxLength": 1024,
                 "type": "string"
+              },
+              "resume_interrupted": {
+                "description": "Assert this target's deletions-only tracked changes are an interrupted removal to finish; part of the fingerprint.",
+                "type": "boolean"
               }
             },
             "required": [],

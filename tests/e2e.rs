@@ -896,9 +896,9 @@ async fn batch_removal_previews_applies_and_replays() {
 }
 
 #[tokio::test]
-async fn interrupted_removal_is_resumed_not_refused() {
+async fn interrupted_removal_needs_evidence_or_the_explicit_flag() {
     let f = fixture().await;
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(Duration::from_secs(90), async {
         let repo = f.repo.display().to_string();
         let (error, text) = call_text(
             &f._client,
@@ -910,10 +910,12 @@ async fn interrupted_removal_is_resumed_not_refused() {
         assert!(!error, "{text}");
         let path = field(&text, "Path").to_owned();
 
-        // Simulate the interrupted removal: only tracked files deleted.
+        // Only tracked files deleted — the interrupted-removal signature, but
+        // also perfectly valid pending work.
         std::fs::remove_file(std::path::Path::new(&path).join("README.md")).unwrap();
         std::fs::remove_file(std::path::Path::new(&path).join(".gitignore")).unwrap();
 
+        // Without evidence the tree stays dirty, and the preview names the flag.
         let (error, preview) = call_text(
             &f._client,
             "remove_worktree",
@@ -921,15 +923,43 @@ async fn interrupted_removal_is_resumed_not_refused() {
         )
         .await;
         assert!(!error, "{preview}");
+        assert!(preview.contains("Eligible: false"), "{preview}");
+        assert!(preview.contains("Veto: dirty"), "{preview}");
+        assert!(preview.contains("resumable_deletion"), "{preview}");
+        assert!(!preview.contains("resumed_removal"), "{preview}");
+        let plain_fingerprint = field(&preview, "Fingerprint").to_owned();
+
+        // Apply without the flag refuses and touches nothing.
+        let (error, text) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "half-deleted", "mode": "apply",
+                "fingerprint": plain_fingerprint}),
+        )
+        .await;
+        assert!(error, "{text}");
+        assert!(text.contains("removal_refused: dirty"), "{text}");
+        assert!(std::path::Path::new(&path).exists());
+
+        // The explicit flag is the evidence (and part of the fingerprint).
+        let (error, preview) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "half-deleted", "mode": "preview",
+                "resume_interrupted": true}),
+        )
+        .await;
+        assert!(!error, "{preview}");
         assert!(preview.contains("Eligible: true (0 vetoes)"), "{preview}");
         assert!(preview.contains("resumed_removal"), "{preview}");
-        let fingerprint = field(&preview, "Fingerprint").to_owned();
+        assert_ne!(field(&preview, "Fingerprint"), plain_fingerprint);
+        let flagged_fingerprint = field(&preview, "Fingerprint").to_owned();
 
         let (error, receipt) = call_text(
             &f._client,
             "remove_worktree",
             serde_json::json!({"repo": repo, "name": "half-deleted", "mode": "apply",
-                "fingerprint": fingerprint}),
+                "fingerprint": flagged_fingerprint, "resume_interrupted": true}),
         )
         .await;
         assert!(!error, "{receipt}");
@@ -942,6 +972,131 @@ async fn interrupted_removal_is_resumed_not_refused() {
             &f.repo,
             &["rev-parse", "--verify", "refs/heads/aw/half-deleted"]
         ));
+
+        // Our own crashed removal (removal_started record) is automatic
+        // evidence: no flag needed.
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "crashed", "creator": "e2e",
+                "purpose": "crashed removal"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        let crashed_path = field(&text, "Path").to_owned();
+        std::fs::remove_file(std::path::Path::new(&crashed_path).join("README.md")).unwrap();
+        let record_path = record_file(f.home.path(), "crashed");
+        let record = std::fs::read_to_string(&record_path).unwrap();
+        let marker = "\"removal_started\":{\"fingerprint\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"at\":1},\"revision\":1";
+        let crashed_record = record.replace("\"revision\":1", marker);
+        std::fs::write(&record_path, crashed_record).unwrap();
+
+        let (error, preview) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "crashed", "mode": "preview"}),
+        )
+        .await;
+        assert!(!error, "{preview}");
+        assert!(preview.contains("Eligible: true (0 vetoes)"), "{preview}");
+        assert!(preview.contains("resumed_removal"), "{preview}");
+        let fingerprint = field(&preview, "Fingerprint").to_owned();
+
+        let (error, receipt) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "crashed", "mode": "apply",
+                "fingerprint": fingerprint}),
+        )
+        .await;
+        assert!(!error, "{receipt}");
+        assert!(
+            receipt.starts_with("COMMITTED remove_worktree "),
+            "{receipt}"
+        );
+        assert!(!std::path::Path::new(&crashed_path).exists());
+        assert!(!record_path.exists(), "record cleaned up");
+        assert!(git_ok(
+            &f.repo,
+            &["rev-parse", "--verify", "refs/heads/aw/crashed"]
+        ));
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+/// Twenty veto-heavy rows fit the page whole; an argument-provably oversized
+/// batch is refused with a clear code instead of a row-less fallback.
+#[tokio::test]
+async fn batch_preview_shows_every_veto_heavy_row_or_refuses_cleanly() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let repo = f.repo.display().to_string();
+        for index in 0..20 {
+            let name = format!("veto-{index:02}");
+            let (error, text) = call_text(
+                &f._client,
+                "create_worktree",
+                serde_json::json!({"repo": repo, "name": name, "creator": "e2e",
+                    "purpose": "veto-heavy batch"}),
+            )
+            .await;
+            assert!(!error, "{text}");
+            std::fs::write(
+                std::path::Path::new(field(&text, "Path")).join("u.txt"),
+                "u\n",
+            )
+            .unwrap();
+        }
+        let targets: Vec<_> = (0..20)
+            .map(|index| serde_json::json!({"name": format!("veto-{index:02}")}))
+            .collect();
+        let (error, preview) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "mode": "preview", "targets": targets}),
+        )
+        .await;
+        assert!(!error, "{preview}");
+        assert!(
+            preview.starts_with("PREVIEW remove_worktree batch: 20 target(s)"),
+            "{preview}"
+        );
+        // Every row is present and vetoed, with no presentation degradation.
+        assert_eq!(
+            preview
+                .lines()
+                .filter(|l| l.contains("eligible=false | vetoes=untracked_files"))
+                .count(),
+            20,
+            "{preview}"
+        );
+        assert!(
+            preview.contains("Summary: eligible=0 refused=20"),
+            "{preview}"
+        );
+        assert!(!preview.contains("presentation_failed"), "{preview}");
+        assert!(
+            preview.len() <= 8192,
+            "page budget exceeded: {}",
+            preview.len()
+        );
+
+        // Nine long path targets cannot fit the page: refused up front with a
+        // clear code, never a truncated or row-less reply.
+        let long = format!("/w/{}", "d".repeat(900));
+        let oversized: Vec<_> = (0..9).map(|_| serde_json::json!({"path": &long})).collect();
+        let (error, refused) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "mode": "preview", "targets": oversized}),
+        )
+        .await;
+        assert!(error, "{refused}");
+        assert!(refused.starts_with("ERROR batch_too_large:"), "{refused}");
+        assert!(refused.contains("smaller batch"), "{refused}");
 
         f._client.cancel().await.unwrap();
     })

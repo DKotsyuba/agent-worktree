@@ -414,16 +414,19 @@ pub enum RemoveOutcome {
 /// before dispatch: Git itself happily removes a worktree whose only content
 /// is ignored files, so this function cannot be the guard for them.
 ///
-/// When `resume_interrupted` is true, the caller has assessed the tree as an
-/// interrupted removal (worktree-side deletions only, verified under the
-/// expected fingerprint): those deletions are first restored from the index
-/// with `git restore --worktree -- .` so Git accepts the removal without
-/// `--force`. Restoring deletions loses no work — the content comes back from
-/// the index and the whole tree is being removed anyway.
+/// `resume_deleted` carries the exact worktree-side deletion paths of an
+/// interrupted removal the caller assessed and fingerprint-verified (empty
+/// for a normal removal): those files — and only those — are restored from
+/// the index first so Git accepts the removal without `--force`. Restoring
+/// never uses `.`: an edit saved between the under-lock observation and this
+/// dispatch must not be reset. Restoring deletions loses no work — the
+/// content comes back from the index and the whole tree is being removed
+/// anyway. A restore failure after dispatch is `OutcomeUnknown`, never a
+/// clean refusal: some files may already be restored.
 pub async fn remove(
     common_dir: &Path,
     worktree_path: &Path,
-    resume_interrupted: bool,
+    resume_deleted: &[String],
     budget: &Budget,
 ) -> Result<RemoveOutcome, GitError> {
     let registrations = inventory(common_dir, budget).await?;
@@ -434,13 +437,8 @@ pub async fn remove(
     if !registered && std::fs::symlink_metadata(worktree_path).is_err() {
         return Ok(RemoveOutcome::AlreadyAbsent);
     }
-    if resume_interrupted {
-        let mut args = s(&["restore", "--worktree", "--"]);
-        args.push(OsString::from("."));
-        let out = run_git(&args, Some(worktree_path), budget, Op::Mutation).await?;
-        if !out.status.success() {
-            return Err(git_failure("git restore", &out));
-        }
+    if !resume_deleted.is_empty() {
+        restore_deleted(worktree_path, resume_deleted, budget).await?;
     }
     let mut args = s(&["worktree", "remove"]);
     args.push(p(worktree_path));
@@ -449,6 +447,60 @@ pub async fn remove(
         Ok(RemoveOutcome::Removed)
     } else {
         Err(git_failure("git worktree remove", &out))
+    }
+}
+
+/// Restores exactly the given deleted paths from the index, in argv chunks
+/// bounded so a huge deletion list cannot exceed the OS argument limit.
+/// Paths are passed as distinct argv entries (never re-parsed by a shell), so
+/// spaces and most bytes are safe; a path Git cannot match simply fails the
+/// restore, which surfaces as `OutcomeUnknown`.
+async fn restore_deleted(
+    worktree_path: &Path,
+    deleted: &[String],
+    budget: &Budget,
+) -> Result<(), GitError> {
+    // ponytail: 64 KiB / 256-path chunks; the 1 MiB status-output cap bounds
+    // the whole list, so at most ~16 chunks in the extreme.
+    let mut chunk: Vec<OsString> = Vec::new();
+    let mut chunk_bytes = 0_usize;
+    for path in deleted {
+        let argument = OsString::from(path);
+        chunk_bytes += argument.len() + 1;
+        chunk.push(argument);
+        if chunk_bytes > 64 * 1024 || chunk.len() >= 256 {
+            restore_chunk(worktree_path, &chunk, budget).await?;
+            chunk.clear();
+            chunk_bytes = 0;
+        }
+    }
+    if !chunk.is_empty() {
+        restore_chunk(worktree_path, &chunk, budget).await?;
+    }
+    Ok(())
+}
+
+/// Runs one `git restore --worktree --` chunk; a failure after dispatch is
+/// uncertain, not refused.
+async fn restore_chunk(
+    worktree_path: &Path,
+    chunk: &[OsString],
+    budget: &Budget,
+) -> Result<(), GitError> {
+    let mut args = s(&["restore", "--worktree", "--"]);
+    args.extend(chunk.iter().cloned());
+    let out = run_git(&args, Some(worktree_path), budget, Op::Mutation).await?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(GitError::new(
+            GitErrorCode::OutcomeUnknown,
+            format!(
+                "git restore failed under {} ({}); some deletions may be restored",
+                worktree_path.display(),
+                out.stderr_line()
+            ),
+        ))
     }
 }
 
@@ -1164,6 +1216,7 @@ fn parse_status(bytes: &[u8]) -> StatusParse {
         ignored: Vec::new(),
         digest: hex_digest(bytes),
         worktree_deletions_only: true,
+        deleted_paths: Vec::new(),
     };
     let mut submodules = SubmoduleFacts {
         dirty: false,
@@ -1180,8 +1233,18 @@ fn parse_status(bytes: &[u8]) -> StatusParse {
                 // Only an unstaged worktree-side deletion (`1 .D`) keeps the
                 // deletions-only signature; a staged entry, a modification or
                 // a rename breaks it.
-                facts.worktree_deletions_only &=
-                    token[0] == b'1' && token[2] == b'.' && token[3] == b'D';
+                let deletion = token[0] == b'1' && token[2] == b'.' && token[3] == b'D';
+                facts.worktree_deletions_only &= deletion;
+                if deletion {
+                    // `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`: the path
+                    // is everything after the eighth space and may itself
+                    // contain spaces (NUL-separated output never quotes it).
+                    if let Some(path) = token.splitn(9, |&byte| byte == b' ').nth(8) {
+                        facts
+                            .deleted_paths
+                            .push(String::from_utf8_lossy(path).into_owned());
+                    }
+                }
                 if token.len() >= 4 {
                     if token[2] != b'.' {
                         facts.staged += 1;
@@ -1777,7 +1840,7 @@ mod tests {
         let cd = common_dir(&main, &budget_secs(30)).await.unwrap();
 
         std::fs::write(wt.join("u.txt"), "u\n").unwrap();
-        let error = remove(&cd, &wt, false, &budget_secs(60)).await.unwrap_err();
+        let error = remove(&cd, &wt, &[], &budget_secs(60)).await.unwrap_err();
         assert_eq!(error.code, GitErrorCode::Conflict);
         assert!(
             error.detail.contains("untracked"),
@@ -1786,7 +1849,7 @@ mod tests {
 
         std::fs::remove_file(wt.join("u.txt")).unwrap();
         assert_eq!(
-            remove(&cd, &wt, false, &budget_secs(60)).await.unwrap(),
+            remove(&cd, &wt, &[], &budget_secs(60)).await.unwrap(),
             RemoveOutcome::Removed
         );
         assert!(!wt.exists());
@@ -1797,7 +1860,7 @@ mod tests {
                 .success()
         );
         assert_eq!(
-            remove(&cd, &wt, false, &budget_secs(60)).await.unwrap(),
+            remove(&cd, &wt, &[], &budget_secs(60)).await.unwrap(),
             RemoveOutcome::AlreadyAbsent
         );
     }
@@ -1815,7 +1878,14 @@ mod tests {
         std::fs::remove_file(wt.join("a.txt")).unwrap();
         std::fs::remove_file(wt.join(".gitignore")).unwrap();
         assert_eq!(
-            remove(&cd, &wt, true, &budget_secs(60)).await.unwrap(),
+            remove(
+                &cd,
+                &wt,
+                &["a.txt".to_owned(), ".gitignore".to_owned()],
+                &budget_secs(60)
+            )
+            .await
+            .unwrap(),
             RemoveOutcome::Removed
         );
         assert!(!wt.exists());
@@ -1919,6 +1989,125 @@ mod tests {
         assert_eq!(error.code, GitErrorCode::NotFound);
     }
 
+    /// Marks a script executable (test-fixture helper).
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A dispatched mutation that misses its deadline is detached, not
+    /// killed: it reports `OutcomeUnknown` at once, finishes in the background
+    /// and is reaped (no zombie).
+    #[tokio::test]
+    async fn mutation_timeout_detaches_and_reaps_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let pid_file = dir.path().join("pid");
+        // A fake program that records its pid, outlives the deadline, then
+        // proves it survived by writing the marker.
+        let script = dir.path().join("slowprog");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nsleep 2\ntouch {}\n",
+                pid_file.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+        let argv: Vec<OsString> = vec![OsString::from("arg")];
+        let tiny = Budget {
+            deadline: Instant::now() + Duration::from_millis(200),
+            max_output_bytes: 1 << 20,
+            max_entries: 100_000,
+        };
+        let started = Instant::now();
+        let program = script.to_string_lossy().into_owned();
+        let error = match run_captured(&program, &argv, None, &tiny, Op::Mutation).await {
+            Err(error) => error,
+            Ok(_) => panic!("the tiny budget must time out"),
+        };
+        assert_eq!(error.code, GitErrorCode::OutcomeUnknown, "{error}");
+        assert!(
+            error.detail.contains("not"),
+            "detail names the detach: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the caller must not wait for the detached child"
+        );
+        // The child was not killed: it runs to completion and writes the marker.
+        let mut wrote_marker = false;
+        for _ in 0..100 {
+            if marker.try_exists().unwrap_or(false) {
+                wrote_marker = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            wrote_marker,
+            "the detached child was killed before finishing"
+        );
+        // … and it is reaped: signaling the pid fails only once the exit
+        // status was collected, so a zombie would keep succeeding here.
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..100 {
+            let signalable = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !signalable {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("pid {pid} is still signalable; the detached child was not reaped");
+    }
+
+    /// The pre-dispatch inventory inside `git::remove` maps its timeout as a
+    /// read: nothing was dispatched, so the outcome is not unknown.
+    #[tokio::test]
+    async fn remove_maps_a_pre_dispatch_read_timeout_as_a_read() {
+        let _env = env_guard();
+        let (dir, main) = repo_with_commit();
+        let wt = dir.path().join("wt");
+        add_worktree(&main, &wt, &[]);
+        let cd = common_dir(&main, &budget_secs(30)).await.unwrap();
+        // A PATH shim whose git sleeps past every deadline.
+        let bin = dir.path().join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("git"), b"#!/bin/sh\n/bin/sleep 5\n").unwrap();
+        make_executable(&bin.join("git"));
+        let saved_path = std::env::var_os("PATH");
+        // SAFETY: held under ENV_LOCK like every environment-editing test.
+        unsafe {
+            std::env::set_var("PATH", &bin);
+        }
+        let tiny = Budget {
+            deadline: Instant::now() + Duration::from_millis(300),
+            max_output_bytes: 1 << 20,
+            max_entries: 100_000,
+        };
+        let error = remove(&cd, &wt, &[], &tiny).await.unwrap_err();
+        // SAFETY: see above.
+        unsafe {
+            match saved_path {
+                Some(ref path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert_eq!(error.code, GitErrorCode::Timeout, "{error}");
+        assert!(wt.exists(), "nothing was dispatched or removed");
+    }
+
     #[tokio::test]
     async fn live_process_with_cwd_inside_is_detected() {
         let _env = env_guard();
@@ -2004,7 +2193,7 @@ mod tests {
         // Git removes ignored-only worktrees without --force; the caller-side
         // IgnoredNotDisposable veto is the only guard, as documented on remove.
         assert_eq!(
-            remove(&cd, &wt, false, &budget_secs(60)).await.unwrap(),
+            remove(&cd, &wt, &[], &budget_secs(60)).await.unwrap(),
             RemoveOutcome::Removed
         );
         assert!(!wt.exists());

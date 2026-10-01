@@ -21,9 +21,15 @@
   10-minute per-target deadline instead of the 30-second mutation budget.
 - Interrupted-removal rule: a registered worktree differing from HEAD only by
   deletions of tracked files (merged or `allow_unmerged`, no live process,
-  ignored leftovers only in `disposable_paths`) no longer vetoes `dirty`; the
-  preview warns `resumed_removal` and apply restores the deletions from the
-  index so Git needs no `--force`.
+  ignored leftovers only in `disposable_paths`) no longer vetoes `dirty` when
+  the interruption is evidenced — the record's own `removal_started` marker or
+  the new fingerprint-bound `resume_interrupted` flag (which also covers
+  foreign worktrees). The preview warns `resumed_removal` and apply restores
+  exactly the observed deletion paths from the index (never the whole tree) so
+  Git needs no `--force`; without evidence the `dirty` veto stands with a
+  `resumable_deletion` hint naming the flag. A read-phase failure before
+  dispatch (for example the pre-dispatch inventory timeout) is no longer
+  reported as an unknown effect.
 
 ## 0.1.1
 
