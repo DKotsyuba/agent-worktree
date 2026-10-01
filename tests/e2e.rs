@@ -763,6 +763,192 @@ async fn unmerged_and_foreign_removal_rules() {
     .expect("e2e deadline");
 }
 
+/// Extracts the fingerprint from one batch preview line.
+fn line_fingerprint(line: &str) -> String {
+    line.rsplit("fingerprint=")
+        .next()
+        .unwrap_or_else(|| panic!("no fingerprint in line: {line}"))
+        .trim()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn batch_removal_previews_applies_and_replays() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let repo = f.repo.display().to_string();
+        let mut paths = Vec::new();
+        for name in ["batch-1", "batch-2", "batch-3"] {
+            let (error, text) = call_text(
+                &f._client,
+                "create_worktree",
+                serde_json::json!({"repo": repo, "name": name, "creator": "e2e",
+                    "purpose": "batch removal"}),
+            )
+            .await;
+            assert!(!error, "{text}");
+            paths.push(field(&text, "Path").to_owned());
+        }
+        // The third tree carries an untracked file.
+        std::fs::write(std::path::Path::new(&paths[2]).join("u.txt"), "u\n").unwrap();
+
+        // Batch preview: two eligible, one vetoed by untracked_files.
+        let (error, preview) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "mode": "preview", "targets": [
+                {"name": "batch-1"}, {"name": "batch-2"}, {"name": "batch-3"}]}),
+        )
+        .await;
+        assert!(!error, "{preview}");
+        assert!(
+            preview.starts_with("PREVIEW remove_worktree batch: 3 target(s)"),
+            "{preview}"
+        );
+        assert!(
+            preview.contains("Summary: eligible=2 refused=1"),
+            "{preview}"
+        );
+        let eligible_count = preview
+            .lines()
+            .filter(|l| l.contains("eligible=true"))
+            .count();
+        assert_eq!(eligible_count, 2, "{preview}");
+        let refused_line = preview
+            .lines()
+            .find(|l| l.contains("/batch-3 |"))
+            .unwrap_or_else(|| panic!("batch-3 line missing:\n{preview}"));
+        assert!(
+            refused_line.contains("vetoes=untracked_files"),
+            "{refused_line}"
+        );
+        let fingerprints: Vec<String> = ["batch-1", "batch-2", "batch-3"]
+            .iter()
+            .map(|name| {
+                let line = preview
+                    .lines()
+                    .find(|l| l.contains(&format!("/{name} |")))
+                    .unwrap_or_else(|| panic!("{name} line missing:\n{preview}"));
+                line_fingerprint(line)
+            })
+            .collect();
+        assert!(fingerprints.iter().all(|fp| fp.len() == 64));
+
+        // Batch apply with every fingerprint: two removed, the third refused
+        // and untouched.
+        let (error, receipt) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "mode": "apply", "targets": [
+                {"name": "batch-1", "fingerprint": fingerprints[0]},
+                {"name": "batch-2", "fingerprint": fingerprints[1]},
+                {"name": "batch-3", "fingerprint": fingerprints[2]}]}),
+        )
+        .await;
+        assert!(!error, "{receipt}");
+        assert!(receipt.contains("/batch-1 | removed"), "{receipt}");
+        assert!(receipt.contains("/batch-2 | removed"), "{receipt}");
+        assert!(
+            receipt.contains("/batch-3 | refused untracked_files"),
+            "{receipt}"
+        );
+        assert!(
+            receipt.contains("Summary: removed=2 refused=1 unknown=0"),
+            "{receipt}"
+        );
+        assert!(!std::path::Path::new(&paths[0]).exists());
+        assert!(!std::path::Path::new(&paths[1]).exists());
+        assert!(std::path::Path::new(&paths[2]).exists(), "third stays");
+        for name in ["batch-1", "batch-2", "batch-3"] {
+            assert!(git_ok(
+                &f.repo,
+                &["rev-parse", "--verify", &format!("refs/heads/aw/{name}")]
+            ));
+        }
+
+        // Replaying the same batch: two already absent, the third still refused.
+        let (error, replay) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "mode": "apply", "targets": [
+                {"name": "batch-1", "fingerprint": fingerprints[0]},
+                {"name": "batch-2", "fingerprint": fingerprints[1]},
+                {"name": "batch-3", "fingerprint": fingerprints[2]}]}),
+        )
+        .await;
+        assert!(!error, "{replay}");
+        assert!(replay.contains("/batch-1 | already_absent"), "{replay}");
+        assert!(replay.contains("/batch-2 | already_absent"), "{replay}");
+        assert!(
+            replay.contains("/batch-3 | refused untracked_files"),
+            "{replay}"
+        );
+        assert!(
+            replay.contains("Summary: removed=0 refused=1 unknown=0"),
+            "{replay}"
+        );
+        assert!(std::path::Path::new(&paths[2]).exists());
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
+#[tokio::test]
+async fn interrupted_removal_is_resumed_not_refused() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let repo = f.repo.display().to_string();
+        let (error, text) = call_text(
+            &f._client,
+            "create_worktree",
+            serde_json::json!({"repo": repo, "name": "half-deleted", "creator": "e2e",
+                "purpose": "interrupted removal"}),
+        )
+        .await;
+        assert!(!error, "{text}");
+        let path = field(&text, "Path").to_owned();
+
+        // Simulate the interrupted removal: only tracked files deleted.
+        std::fs::remove_file(std::path::Path::new(&path).join("README.md")).unwrap();
+        std::fs::remove_file(std::path::Path::new(&path).join(".gitignore")).unwrap();
+
+        let (error, preview) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "half-deleted", "mode": "preview"}),
+        )
+        .await;
+        assert!(!error, "{preview}");
+        assert!(preview.contains("Eligible: true (0 vetoes)"), "{preview}");
+        assert!(preview.contains("resumed_removal"), "{preview}");
+        let fingerprint = field(&preview, "Fingerprint").to_owned();
+
+        let (error, receipt) = call_text(
+            &f._client,
+            "remove_worktree",
+            serde_json::json!({"repo": repo, "name": "half-deleted", "mode": "apply",
+                "fingerprint": fingerprint}),
+        )
+        .await;
+        assert!(!error, "{receipt}");
+        assert!(
+            receipt.starts_with("COMMITTED remove_worktree "),
+            "{receipt}"
+        );
+        assert!(!std::path::Path::new(&path).exists(), "tree removed");
+        assert!(git_ok(
+            &f.repo,
+            &["rev-parse", "--verify", "refs/heads/aw/half-deleted"]
+        ));
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}
+
 #[tokio::test]
 async fn old_worktree_shows_as_stale_in_list_and_hygiene() {
     let f = fixture().await;

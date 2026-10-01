@@ -1,0 +1,5 @@
+PREVIEW remove_worktree batch: {{ count }} target(s)
+{% for row in rows %}
+{{ row.key }} | {{ row.path }} | head={{ row.head }} | branch={{ row.branch }} | eligible={{ row.eligible }} | vetoes={{ row.vetoes }} | warnings={{ row.warnings }} | fingerprint={{ row.fingerprint }}
+{% endfor %}
+Summary: eligible={{ eligible }} refused={{ refused }}

@@ -45,6 +45,14 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
             "remove_worktree_receipt",
             tool_remove_worktree::RECEIPT_TEMPLATE,
         ),
+        (
+            "remove_worktree_batch",
+            tool_remove_worktree::BATCH_TEMPLATE,
+        ),
+        (
+            "remove_worktree_batch_receipt",
+            tool_remove_worktree::BATCH_RECEIPT_TEMPLATE,
+        ),
         ("prune_worktrees", tool_prune_worktrees::TEMPLATE),
         // xtask:templates
     ]

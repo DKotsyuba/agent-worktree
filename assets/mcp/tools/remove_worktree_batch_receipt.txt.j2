@@ -1,0 +1,5 @@
+{{ status }} remove_worktree batch: {{ total }} target(s)
+{% for row in rows %}
+{{ row.key }} | {{ row.outcome }}
+{% endfor %}
+Summary: removed={{ removed }} refused={{ refused }} unknown={{ unknown }}

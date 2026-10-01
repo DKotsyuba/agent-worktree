@@ -173,7 +173,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Remove one worktree. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes it under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. An interrupted apply stays visible through the record's removal_started marker.",
+    "description": "Remove one worktree, or a batch of up to 20 targets of one repository. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. A tree left half-deleted by an interrupted removal (tracked-file deletions only) is resumed, not refused. An interrupted apply stays visible through the record's removal_started marker.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -212,8 +212,49 @@
           "type": "string"
         },
         "repo": {
-          "description": "Repository root or any worktree inside it.",
+          "description": "Repository root or any worktree inside it; the single repository every target belongs to.",
           "type": "string"
+        },
+        "targets": {
+          "description": "Batch form: 1-20 targets removed in one call, all in repo. Mutually exclusive with name, path, disposable_paths, allow_unmerged and fingerprint.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "allow_unmerged": {
+                "description": "Explicitly allow removing this unmerged worktree; the branch is retained.",
+                "type": "boolean"
+              },
+              "disposable_paths": {
+                "description": "Ignored paths approved for this target's deletion, worktree-relative.",
+                "items": {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "fingerprint": {
+                "description": "Fingerprint returned by this target's preview; required for apply.",
+                "maxLength": 64,
+                "type": "string"
+              },
+              "name": {
+                "description": "Worktree directory name; provide exactly one of name or path.",
+                "maxLength": 64,
+                "type": "string"
+              },
+              "path": {
+                "description": "Absolute worktree path; provide exactly one of name or path.",
+                "maxLength": 1024,
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
         }
       },
       "required": [

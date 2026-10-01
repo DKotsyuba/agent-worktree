@@ -263,18 +263,17 @@ pub struct Size {
 /// Facts from one `git status --porcelain=v2 -z --ignored=matching` run.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StatusFacts {
-    /// Number of staged tracked changes.
     pub staged: u64,
-    /// Number of unstaged tracked changes.
     pub unstaged: u64,
-    /// Number of untracked files.
     pub untracked: u64,
-    /// Number of unresolved conflict entries.
     pub conflicts: u64,
-    /// Ignored entries as printed by Git.
     pub ignored: Vec<String>,
-    /// Hex digest of the raw status output; part of the removal fingerprint.
     pub digest: String,
+    /// True when every status entry is an unstaged worktree-side deletion
+    /// (`1 .D` only): nothing staged, modified, renamed, untracked or
+    /// conflicted. This is the signature of an interrupted removal, which a
+    /// merged and unoccupied tree may resume.
+    pub worktree_deletions_only: bool,
 }
 
 /// Submodule observation used by removal vetoes.
@@ -509,6 +508,9 @@ pub enum Warning {
     },
     /// The record shows a dispatched removal that never completed.
     RemovalStarted,
+    /// The tree differs from HEAD only through worktree-side deletions, the
+    /// signature of an interrupted removal; apply may finish the removal.
+    ResumedRemoval,
     /// The stored record disagrees with the observed worktree identity or bound
     /// path and was ignored for this decision.
     RecordMismatch,
@@ -733,8 +735,24 @@ pub fn assess_removal(
     }
 
     if let Some(facts) = probe_value(&observation.status) {
+        // Interrupted-removal rule: a registered tree that differs from HEAD
+        // only through worktree-side deletions — nothing staged, modified,
+        // renamed, untracked or conflicted, ignored leftovers still bound to
+        // the approved disposable paths below — is a half-finished removal
+        // this tool may finish, provided HEAD is merged (or explicitly
+        // allowed) and no live process occupies the tree. Anything else keeps
+        // today's `dirty` veto.
+        let resumed_removal = facts.worktree_deletions_only
+            && probe_value(&observation.live_processes).copied() != Some(true)
+            && (request.allow_unmerged
+                || probe_value(&observation.integration).copied()
+                    == Some(Integration::AncestorMerged));
         if facts.staged > 0 || facts.unstaged > 0 {
-            vetoes.push(Veto::Dirty);
+            if resumed_removal {
+                warnings.push(Warning::ResumedRemoval);
+            } else {
+                vetoes.push(Veto::Dirty);
+            }
         }
         if facts.untracked > 0 {
             vetoes.push(Veto::UntrackedFiles);
@@ -1025,6 +1043,7 @@ mod tests {
                 conflicts: 0,
                 ignored: Vec::new(),
                 digest: "cafe01".to_owned(),
+                worktree_deletions_only: false,
             }),
             submodules: Probe::Known(SubmoduleFacts {
                 dirty: false,
@@ -1225,6 +1244,7 @@ mod tests {
                     conflicts: 0,
                     ignored: Vec::new(),
                     digest: "cafe01".to_owned(),
+                    worktree_deletions_only: false,
                 },
                 reason: "output cap hit".to_owned(),
             }
@@ -1408,6 +1428,7 @@ mod tests {
                             conflicts: 0,
                             ignored: Vec::new(),
                             digest: "cafe01".to_owned(),
+                            worktree_deletions_only: false,
                         },
                         reason: "output cap hit".to_owned(),
                     }
@@ -1548,6 +1569,7 @@ mod tests {
                     conflicts: 0,
                     ignored: Vec::new(),
                     digest: "cafe01".to_owned(),
+                    worktree_deletions_only: false,
                 },
                 reason: "output cap hit".to_owned(),
             }
@@ -1583,6 +1605,61 @@ mod tests {
         });
         let decision = assess_removal(&unmerged, None, &RemovalRequest::default(), &policy);
         assert!(decision.warnings.contains(&Warning::Unmerged));
+    }
+
+    #[test]
+    fn interrupted_removal_rule_table() {
+        let policy = Policy::default();
+        let deletions = with_status(&clean_observation(), |facts| {
+            facts.unstaged = 2;
+            facts.worktree_deletions_only = true;
+        });
+        // Deletions only, merged and unoccupied: eligible with the warning.
+        let decision = assess_removal(&deletions, None, &RemovalRequest::default(), &policy);
+        assert!(decision.vetoes.is_empty(), "{:?}", decision.vetoes);
+        assert!(decision.warnings.contains(&Warning::ResumedRemoval));
+
+        // Deletions plus one modification: today's dirty veto.
+        let modified = with_status(&clean_observation(), |facts| {
+            facts.unstaged = 3;
+        });
+        let decision = assess_removal(&modified, None, &RemovalRequest::default(), &policy);
+        assert!(decision.vetoes.contains(&Veto::Dirty));
+        assert!(!decision.warnings.contains(&Warning::ResumedRemoval));
+
+        // Deletions plus an untracked file: the untracked veto, no resume.
+        let untracked = with_status(&deletions, |facts| {
+            facts.untracked = 1;
+            facts.worktree_deletions_only = false;
+        });
+        let decision = assess_removal(&untracked, None, &RemovalRequest::default(), &policy);
+        assert!(decision.vetoes.contains(&Veto::UntrackedFiles));
+        assert!(decision.vetoes.contains(&Veto::Dirty));
+        assert!(!decision.warnings.contains(&Warning::ResumedRemoval));
+
+        // Unmerged deletions-only tree: the waiver needs merged HEAD …
+        let unmerged = with(&deletions, |o| {
+            o.integration = Probe::Known(Integration::Unmerged)
+        });
+        let decision = assess_removal(&unmerged, None, &RemovalRequest::default(), &policy);
+        assert!(decision.vetoes.contains(&Veto::Dirty));
+        assert!(decision.vetoes.contains(&Veto::Unmerged));
+        assert!(!decision.warnings.contains(&Warning::ResumedRemoval));
+        // … unless the request explicitly allows unmerged.
+        let allowed = RemovalRequest {
+            allow_unmerged: true,
+            ..RemovalRequest::default()
+        };
+        let decision = assess_removal(&unmerged, None, &allowed, &policy);
+        assert!(decision.vetoes.is_empty(), "{:?}", decision.vetoes);
+        assert!(decision.warnings.contains(&Warning::ResumedRemoval));
+
+        // A live process keeps the deletions dirty.
+        let occupied = with(&deletions, |o| o.live_processes = Probe::Known(true));
+        let decision = assess_removal(&occupied, None, &RemovalRequest::default(), &policy);
+        assert!(decision.vetoes.contains(&Veto::Dirty));
+        assert!(decision.vetoes.contains(&Veto::LiveProcess));
+        assert!(!decision.warnings.contains(&Warning::ResumedRemoval));
     }
 
     #[test]

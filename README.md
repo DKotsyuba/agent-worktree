@@ -17,7 +17,7 @@ cannot reconstruct — who created a worktree, why, and when.
 | [`create_worktree`](docs/tools/create_worktree.md) | external-write | create under `<root>/<label>--<id12>/<name>` on branch `aw/<name>`, with who/why/when metadata; idempotent replays |
 | [`list_worktrees`](docs/tools/list_worktrees.md) | read | keyset-paginated inventory of every worktree of a known repository, with activity, merge state and hygiene warnings |
 | [`inspect_worktree`](docs/tools/inspect_worktree.md) | read | bounded evidence for one worktree: activity, integration, status, processes, size |
-| [`remove_worktree`](docs/tools/remove_worktree.md) | external-write | preview (fingerprint + vetoes) then apply; never `--force`, never deletes branches |
+| [`remove_worktree`](docs/tools/remove_worktree.md) | external-write | preview (fingerprint + vetoes) then apply, single target or a ≤ 20-target batch of one repo; resumes interrupted removals; never `--force`, never deletes branches |
 | [`prune_worktrees`](docs/tools/prune_worktrees.md) | external-write | drop registrations of missing worktrees; dry run by default |
 
 Behaviour truth source: [docs/architecture.md](docs/architecture.md) and

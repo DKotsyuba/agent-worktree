@@ -11,7 +11,7 @@ use crate::git::{self, Checks, CreateSpec, GitError, GitErrorCode, ObserveSpec};
 use crate::store::{self, KnownRepo, Layout, StoreError};
 use crate::worktree::{
     self, Activity, Advice, Budget, Decision, Fingerprint, Integration, Observation, Policy,
-    RECORD_SCHEMA_VERSION, Record, RemovalRequest, RepoId, WorktreeClass, WorktreeName,
+    RECORD_SCHEMA_VERSION, Record, RemovalRequest, RepoId, Warning, WorktreeClass, WorktreeName,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -21,6 +21,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Mutation deadline in seconds, including lock waits and verification.
 const MUTATION_SECS: u64 = 30;
+/// Removal deadline in seconds, per target (including lock wait, verification
+/// and the dispatched `git worktree remove`). Removing a multi-GiB worktree can
+/// easily outgrow the generic mutation budget — a removal killed mid-delete
+/// leaves a half-deleted tree that then vetoes itself as dirty — so removals
+/// get this larger bounded deadline and are never killed by it (a dispatched
+/// removal that misses it is detached and reported as `outcome_unknown`).
+const REMOVE_MUTATION_SECS: u64 = 600;
+/// Maximum number of targets accepted in one `remove_worktree` batch call.
+pub const MAX_REMOVE_TARGETS: usize = 20;
+/// Conservative per-line furniture (status, vetoes, warnings, fingerprint)
+/// added to each target's identity when pre-checking the batch page budget.
+const REMOVE_BATCH_LINE_FURNITURE: usize = 384;
+/// Page budget of a remove batch reply: one compact line per target, never
+/// truncated — an oversized batch is refused before any effect instead
+/// (per `docs/MCP_RESPONSE_STANDARD.md`, oversized pages are refused).
+const REMOVE_BATCH_PAGE_BUDGET: usize = 8 * 1024;
 /// Overall deadline for one list call, shared by every inventory in scope.
 const LIST_SECS: u64 = 30;
 /// Per-repository inventory deadline in seconds.
@@ -924,29 +940,139 @@ impl Service {
         })
     }
 
-    /// Previews or applies one worktree removal; never forces, never drops branches.
+    /// Previews or applies one worktree removal, or a batch of up to
+    /// [`MAX_REMOVE_TARGETS`] targets of one repository; never forces, never
+    /// drops branches.
+    ///
+    /// The single-target form (`name`/`path` plus the top-level options)
+    /// keeps its exact behavior. The batch form (`targets`) resolves every
+    /// target against the one `repo` scope — a target registered in another
+    /// repository is simply `not_found` — and processes targets sequentially,
+    /// each through the identical single-target safety path; a refusal or
+    /// failure of one target never stops, hides or rolls back the others.
     pub async fn remove_worktree(&self, args: &RemoveArgs) -> Result<RemoveOutcome, ServiceError> {
         validate_repo_path(&args.repo)?;
         let mode = RemoveMode::parse(args.mode.as_str())?;
-        if args.name.is_some() == args.path.is_some() {
-            return Err(ServiceError::blocked(
-                "target_required",
-                "exactly one of name or path must be provided",
-            ));
-        }
-        if mode == RemoveMode::Apply && args.fingerprint.is_none() {
-            return Err(ServiceError::blocked(
-                "fingerprint_required",
-                "apply mode requires the fingerprint returned by the preview",
-            )
-            .with_next("run mode=preview first"));
-        }
-        let disposable = validate_disposable(args.disposable_paths.as_deref().unwrap_or(&[]))?;
-        let allow_unmerged = args.allow_unmerged.unwrap_or(false);
+        let items = normalize_remove_items(args, mode)?;
         let layout = self.layout()?;
         let scope = self.repo_scope(&layout, &args.repo).await?;
+        if let [single] = &items[..] {
+            return self.remove_one(&layout, &scope, mode, single).await;
+        }
+        match mode {
+            RemoveMode::Preview => {
+                let mut rows = Vec::with_capacity(items.len());
+                for item in &items {
+                    let key = format!("{}/{}", scope.repo_id.id12(), item.identity());
+                    let row = match self.remove_one(&layout, &scope, mode, item).await {
+                        Ok(RemoveOutcome::Preview {
+                            key,
+                            path,
+                            head,
+                            branch,
+                            decision,
+                            ..
+                        }) => BatchPreviewRow {
+                            key,
+                            path: path.display().to_string(),
+                            head,
+                            branch,
+                            decision: Some(decision),
+                            refusal: None,
+                        },
+                        Ok(_) => BatchPreviewRow {
+                            key,
+                            path: item.identity(),
+                            head: None,
+                            branch: None,
+                            decision: None,
+                            refusal: Some("invalid_mode".to_owned()),
+                        },
+                        Err(error) => BatchPreviewRow {
+                            key,
+                            path: item.identity(),
+                            head: None,
+                            branch: None,
+                            decision: None,
+                            refusal: Some(error.code),
+                        },
+                    };
+                    rows.push(row);
+                }
+                let eligible = rows
+                    .iter()
+                    .filter(|row| row.decision.as_ref().is_some_and(|d| d.vetoes.is_empty()))
+                    .count();
+                Ok(RemoveOutcome::BatchPreview { rows, eligible })
+            }
+            RemoveMode::Apply => {
+                let mut rows = Vec::with_capacity(items.len());
+                for item in &items {
+                    let key = format!("{}/{}", scope.repo_id.id12(), item.identity());
+                    let (key, kind) = match self.remove_one(&layout, &scope, mode, item).await {
+                        Ok(RemoveOutcome::Applied {
+                            key: resolved,
+                            outcome,
+                            ..
+                        }) => (
+                            resolved,
+                            match outcome {
+                                RemoveOutcomeKind::Removed => BatchApplyKind::Removed,
+                                RemoveOutcomeKind::AlreadyAbsent => BatchApplyKind::AlreadyAbsent,
+                            },
+                        ),
+                        Ok(_) => (key, BatchApplyKind::Refused("invalid_mode".to_owned())),
+                        Err(error) if error.outcome == ServiceOutcome::OutcomeUnknown => (
+                            key,
+                            BatchApplyKind::OutcomeUnknown {
+                                path: error
+                                    .unknown
+                                    .as_ref()
+                                    .map(|unknown| unknown.path.clone())
+                                    .unwrap_or_else(|| item.identity()),
+                            },
+                        ),
+                        // The detail of a removal_refused error carries the codes.
+                        Err(error) if error.code == "removal_refused" => {
+                            (key, BatchApplyKind::Refused(error.detail))
+                        }
+                        Err(error) => (key, BatchApplyKind::Refused(error.code)),
+                    };
+                    rows.push(BatchApplyRow { key, kind });
+                }
+                let removed = rows
+                    .iter()
+                    .filter(|row| matches!(row.kind, BatchApplyKind::Removed))
+                    .count();
+                let refused = rows
+                    .iter()
+                    .filter(|row| matches!(row.kind, BatchApplyKind::Refused(_)))
+                    .count();
+                let unknown = rows
+                    .iter()
+                    .filter(|row| matches!(row.kind, BatchApplyKind::OutcomeUnknown { .. }))
+                    .count();
+                Ok(RemoveOutcome::BatchApplied {
+                    rows,
+                    removed,
+                    refused,
+                    unknown,
+                })
+            }
+        }
+    }
+
+    /// Runs the single-target removal path for one validated item: resolve,
+    /// observe, assess, then preview or fingerprint-guarded apply.
+    async fn remove_one(
+        &self,
+        layout: &Layout,
+        scope: &RepoScope,
+        mode: RemoveMode,
+        item: &RemoveItem,
+    ) -> Result<RemoveOutcome, ServiceError> {
         let resolved = match self
-            .resolve_target(&scope, args.name.as_deref(), args.path.as_deref())
+            .resolve_target(scope, item.name.as_deref(), item.path.as_deref())
             .await
         {
             Ok(resolved) => resolved,
@@ -955,12 +1081,18 @@ impl Service {
             Err(error)
                 if mode == RemoveMode::Apply
                     && error.code == "not_found"
-                    && !replay_target(&layout, &scope, args)
-                        .1
-                        .try_exists()
-                        .unwrap_or(false) =>
+                    && !replay_target(
+                        layout,
+                        scope,
+                        item.name.as_deref(),
+                        item.path.as_deref(),
+                    )
+                    .1
+                    .try_exists()
+                    .unwrap_or(false) =>
             {
-                let (name, path) = replay_target(&layout, &scope, args);
+                let (name, path) =
+                    replay_target(layout, scope, item.name.as_deref(), item.path.as_deref());
                 let mut warnings = Vec::new();
                 // A crashed removal can leave a record with removal_started
                 // behind while tree and registration are gone; that record
@@ -970,10 +1102,13 @@ impl Service {
                     && record.path == path
                     && record.removal_started.is_some()
                     && let Err(error) = (|| async {
-                        let guard =
-                            store::lock_repo(&layout.home, &scope.repo_id, &budget(MUTATION_SECS))
-                                .await
-                                .map_err(store_error)?;
+                        let guard = store::lock_repo(
+                            &layout.home,
+                            &scope.repo_id,
+                            &budget(REMOVE_MUTATION_SECS),
+                        )
+                        .await
+                        .map_err(store_error)?;
                         store::delete_record(
                             &layout.home,
                             &guard,
@@ -1013,8 +1148,8 @@ impl Service {
         };
         let request = RemovalRequest {
             expected_fingerprint: None,
-            disposable_paths: disposable.clone(),
-            allow_unmerged,
+            disposable_paths: item.disposable.clone(),
+            allow_unmerged: item.allow_unmerged,
         };
         if mode == RemoveMode::Preview {
             let observation = git::observe(
@@ -1035,19 +1170,17 @@ impl Service {
                 path: target.path,
                 head: target.head.clone(),
                 branch: target.branch.clone(),
-                disposable,
+                disposable: item.disposable.clone(),
                 decision,
             });
         }
 
-        let fingerprint = match &args.fingerprint {
-            Some(value) => Fingerprint::parse(value).map_err(|e| {
-                ServiceError::blocked(e.code(), "fingerprint must be 64 lowercase hex characters")
-            })?,
+        let fingerprint = item
+            .fingerprint
+            .clone()
             // Presence was checked before any state access.
-            None => return Err(ServiceError::blocked("fingerprint_required", "unreachable")),
-        };
-        let op_budget = budget(MUTATION_SECS);
+            .ok_or_else(|| ServiceError::blocked("fingerprint_required", "unreachable"))?;
+        let op_budget = budget(REMOVE_MUTATION_SECS);
         let guard = store::lock_repo(&layout.home, &scope.repo_id, &op_budget)
             .await
             .map_err(store_error)?;
@@ -1064,8 +1197,8 @@ impl Service {
         .map_err(git_read_error)?;
         let request = RemovalRequest {
             expected_fingerprint: Some(fingerprint),
-            disposable_paths: disposable,
-            allow_unmerged,
+            disposable_paths: item.disposable.clone(),
+            allow_unmerged: item.allow_unmerged,
         };
         let decision =
             worktree::assess_removal(&observation, record.as_ref(), &request, &self.policy);
@@ -1076,10 +1209,8 @@ impl Service {
                 .map(|v| v.code())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(
-                ServiceError::blocked("removal_refused", format!("refused: {codes}"))
-                    .with_next("resolve the vetoes, then rerun the preview"),
-            );
+            return Err(ServiceError::blocked("removal_refused", codes)
+                .with_next("resolve the vetoes, then rerun the preview"));
         }
         let fingerprint = decision.fingerprint.clone().ok_or_else(|| {
             ServiceError::blocked("probe_unknown", "required probes were not known; refusing")
@@ -1103,7 +1234,11 @@ impl Service {
 
         let branch = target.branch.clone();
         let path = target.path.clone();
-        let removed = git::remove(&scope.common_dir, &path, &op_budget)
+        // An interrupted removal assessed as deletions-only is resumed: the
+        // deletions are restored from the index inside `git::remove` so Git
+        // accepts the removal without `--force`.
+        let resume_interrupted = decision.warnings.contains(&Warning::ResumedRemoval);
+        let removed = git::remove(&scope.common_dir, &path, resume_interrupted, &op_budget)
             .await
             .map_err(|e| git_mutation_error(e, &format!("remove_worktree {key}"), &path))?;
         // The effect is confirmed past this point; cleanup problems are warnings.
@@ -1336,22 +1471,27 @@ struct Target {
 }
 
 /// Best-effort (name, path) identity for an apply replay that found nothing.
-fn replay_target(layout: &Layout, scope: &RepoScope, args: &RemoveArgs) -> (String, PathBuf) {
+fn replay_target(
+    layout: &Layout,
+    scope: &RepoScope,
+    name: Option<&str>,
+    path: Option<&str>,
+) -> (String, PathBuf) {
     // The root is canonicalized when present so the reconstructed path can be
     // compared with the record's bound path regardless of /var vs /private.
     let root = layout
         .root
         .as_ref()
         .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()));
-    match (&args.name, &args.path) {
+    match (name, path) {
         (Some(name), None) => match root {
             Some(root) => (
-                name.clone(),
+                name.to_owned(),
                 root.join(worktree::repo_directory(&scope.label, &scope.repo_id))
                     .join(name),
             ),
             // Without a configured root the path cannot be reconstructed.
-            None => (name.clone(), PathBuf::new()),
+            None => (name.to_owned(), PathBuf::new()),
         },
         (_, Some(path)) => (base_name(Path::new(path)), canonicalize_gone(path)),
         _ => (String::new(), PathBuf::new()),
@@ -2053,20 +2193,179 @@ impl InspectArgs {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RemoveArgs {
-    /// Repository root or any worktree inside it.
+    /// Repository root or any worktree inside it; the single common repository
+    /// of the call — every batch target must belong to it.
     pub repo: String,
-    /// Worktree directory name.
+    /// Worktree directory name (single-target form).
     pub name: Option<String>,
-    /// Absolute worktree path.
+    /// Absolute worktree path (single-target form).
     pub path: Option<String>,
     /// `preview` (assess and fingerprint) or `apply` (remove under the fingerprint).
     pub mode: String,
+    /// Ignored paths approved for deletion, worktree-relative (single-target form).
+    pub disposable_paths: Option<Vec<String>>,
+    /// Explicit confirmation allowing removal of an unmerged worktree
+    /// (single-target form).
+    pub allow_unmerged: Option<bool>,
+    /// Fingerprint returned by the preview being applied (single-target form).
+    pub fingerprint: Option<String>,
+    /// Batch form: 1–[`MAX_REMOVE_TARGETS`] targets removed in one call,
+    /// mutually exclusive with the single-target fields above.
+    pub targets: Option<Vec<RemoveTargetArgs>>,
+}
+
+/// One target of a `remove_worktree` batch call.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveTargetArgs {
+    /// Worktree directory name; provide exactly one of name or path.
+    pub name: Option<String>,
+    /// Absolute worktree path; provide exactly one of name or path.
+    pub path: Option<String>,
     /// Ignored paths approved for deletion, worktree-relative.
     pub disposable_paths: Option<Vec<String>>,
     /// Explicit confirmation allowing removal of an unmerged worktree.
     pub allow_unmerged: Option<bool>,
-    /// Fingerprint returned by the preview being applied.
+    /// Fingerprint returned by this target's preview; required for apply.
     pub fingerprint: Option<String>,
+}
+
+impl RemoveTargetArgs {
+    /// The caller-supplied identity (name or path), used by the tools layer's
+    /// conservative batch page-budget estimate.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        self.name.as_deref().or(self.path.as_deref()).unwrap_or("")
+    }
+}
+
+/// One validated removal target, shared by the single-target and batch forms.
+struct RemoveItem {
+    /// Worktree directory name, or `None` when addressed by path.
+    name: Option<String>,
+    /// Absolute worktree path, or `None` when addressed by name.
+    path: Option<String>,
+    /// Approved disposable paths, worktree-relative.
+    disposable: Vec<PathBuf>,
+    /// Explicit confirmation allowing removal of an unmerged worktree.
+    allow_unmerged: bool,
+    /// Apply only: the expected preview fingerprint, already parsed.
+    fingerprint: Option<Fingerprint>,
+}
+
+impl RemoveItem {
+    /// The caller-supplied identity (name or path) used for batch rows and
+    /// replay paths when the target cannot be resolved.
+    fn identity(&self) -> String {
+        self.path
+            .clone()
+            .or_else(|| self.name.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Validates the arguments of either form and normalizes them into removal
+/// items: one for the single-target form, one per entry for the batch form.
+/// All validation happens before any state is accessed or effect dispatched.
+fn normalize_remove_items(
+    args: &RemoveArgs,
+    mode: RemoveMode,
+) -> Result<Vec<RemoveItem>, ServiceError> {
+    let Some(targets) = &args.targets else {
+        // Single-target form: exactly one of name or path, and the apply
+        // fingerprint, are checked before any state access.
+        if args.name.is_some() == args.path.is_some() {
+            return Err(ServiceError::blocked(
+                "target_required",
+                "exactly one of name or path must be provided",
+            ));
+        }
+        if mode == RemoveMode::Apply && args.fingerprint.is_none() {
+            return Err(ServiceError::blocked(
+                "fingerprint_required",
+                "apply mode requires the fingerprint returned by the preview",
+            )
+            .with_next("run mode=preview first"));
+        }
+        return Ok(vec![RemoveItem {
+            name: args.name.clone(),
+            path: args.path.clone(),
+            disposable: validate_disposable(args.disposable_paths.as_deref().unwrap_or(&[]))?,
+            allow_unmerged: args.allow_unmerged.unwrap_or(false),
+            fingerprint: parse_fingerprint(args.fingerprint.as_deref())?,
+        }]);
+    };
+    // Batch form: mutually exclusive with the single-target fields.
+    if args.name.is_some()
+        || args.path.is_some()
+        || args.disposable_paths.is_some()
+        || args.allow_unmerged.is_some()
+        || args.fingerprint.is_some()
+    {
+        return Err(ServiceError::blocked(
+            "targets_conflict",
+            "targets cannot be combined with name, path, disposable_paths, \
+             allow_unmerged or fingerprint",
+        ));
+    }
+    if targets.is_empty() || targets.len() > MAX_REMOVE_TARGETS {
+        return Err(ServiceError::blocked(
+            "targets_invalid",
+            format!("targets must contain between 1 and {MAX_REMOVE_TARGETS} entries"),
+        ));
+    }
+    // A batch reply is one compact line per target inside the page budget and
+    // is never truncated: refuse up front when even a conservative estimate
+    // cannot fit, before any effect is considered.
+    let estimate = 128
+        + targets
+            .iter()
+            .map(|target| target.identity().len() + REMOVE_BATCH_LINE_FURNITURE)
+            .sum::<usize>();
+    if estimate > REMOVE_BATCH_PAGE_BUDGET {
+        return Err(ServiceError::blocked(
+            "batch_too_large",
+            "the batch reply cannot fit the 8 KiB page budget without truncation",
+        )
+        .with_next("retry with a smaller batch, or one remove_worktree call per target"));
+    }
+    let mut items = Vec::with_capacity(targets.len());
+    for (index, target) in targets.iter().enumerate() {
+        let position = index + 1;
+        if target.name.is_some() == target.path.is_some() {
+            return Err(ServiceError::blocked(
+                "targets_invalid",
+                format!("target {position}: provide exactly one of name or path"),
+            ));
+        }
+        if mode == RemoveMode::Apply && target.fingerprint.is_none() {
+            return Err(ServiceError::blocked(
+                "fingerprint_required",
+                format!(
+                    "apply mode requires the fingerprint returned by the preview \
+                     for target {position}"
+                ),
+            )
+            .with_next("run mode=preview first"));
+        }
+        items.push(RemoveItem {
+            name: target.name.clone(),
+            path: target.path.clone(),
+            disposable: validate_disposable(target.disposable_paths.as_deref().unwrap_or(&[]))?,
+            allow_unmerged: target.allow_unmerged.unwrap_or(false),
+            fingerprint: parse_fingerprint(target.fingerprint.as_deref())?,
+        });
+    }
+    Ok(items)
+}
+
+/// Parses an optional apply fingerprint into its validated form.
+fn parse_fingerprint(value: Option<&str>) -> Result<Option<Fingerprint>, ServiceError> {
+    value.map_or(Ok(None), |value| {
+        Fingerprint::parse(value).map(Some).map_err(|e| {
+            ServiceError::blocked(e.code(), "fingerprint must be 64 lowercase hex characters")
+        })
+    })
 }
 
 /// Removal modes.
@@ -2322,7 +2621,6 @@ pub fn activity_label(activity: Activity) -> &'static str {
     }
 }
 
-/// Result of a successful removal call.
 pub enum RemoveOutcome {
     /// Assessment without effect.
     Preview {
@@ -2352,6 +2650,67 @@ pub enum RemoveOutcome {
         /// Non-blocking follow-up problems (stable codes).
         warnings: Vec<String>,
     },
+    /// Batch preview: one row per requested target, in request order.
+    BatchPreview {
+        /// One row per target.
+        rows: Vec<BatchPreviewRow>,
+        /// Rows whose decision has no veto.
+        eligible: usize,
+    },
+    /// Batch apply executed: one row per requested target, in request order.
+    BatchApplied {
+        /// One row per target.
+        rows: Vec<BatchApplyRow>,
+        /// Targets whose tree and registration were removed.
+        removed: usize,
+        /// Targets that were refused (veto codes or a stable error code).
+        refused: usize,
+        /// Targets whose removal outcome is unknown and needs reconciliation.
+        unknown: usize,
+    },
+}
+
+/// One row of a batch preview: the single-target preview facts, or the stable
+/// refusal code when the target could not be resolved or observed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BatchPreviewRow {
+    /// Compact tool key `<id12>/<name>`.
+    pub key: String,
+    /// Exact worktree path, or the caller-supplied identity when unresolved.
+    pub path: String,
+    /// Current HEAD commit, when Git reported it for the target.
+    pub head: Option<String>,
+    /// Current branch ref, when HEAD is attached.
+    pub branch: Option<String>,
+    /// Vetoes, warnings and fingerprint; `None` when the target was not assessed.
+    pub decision: Option<Decision>,
+    /// Stable refusal code replacing the decision when the target failed.
+    pub refusal: Option<String>,
+}
+
+/// Outcome of one target inside a batch apply.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum BatchApplyKind {
+    /// The working tree and its registration were removed.
+    Removed,
+    /// Nothing existed to remove; a safe replay is a no-op.
+    AlreadyAbsent,
+    /// The target was refused; carries the veto codes or a stable error code.
+    Refused(String),
+    /// The removal may still be running; carries the exact path to inspect.
+    OutcomeUnknown {
+        /// Exact path to inspect before any retry.
+        path: String,
+    },
+}
+
+/// One row of a batch apply receipt.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BatchApplyRow {
+    /// Compact tool key `<id12>/<name>`.
+    pub key: String,
+    /// This target's outcome.
+    pub kind: BatchApplyKind,
 }
 
 /// Git-level removal result.

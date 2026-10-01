@@ -272,6 +272,7 @@ pub fn warning_label(warning: &crate::worktree::Warning) -> String {
             format!("probe_incomplete ({})", bounded(reason, 80))
         }
         Warning::RemovalStarted => "removal_started".to_owned(),
+        Warning::ResumedRemoval => "resumed_removal".to_owned(),
         Warning::RecordMismatch => "record_mismatch".to_owned(),
     }
 }

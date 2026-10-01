@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Added
+
+- `remove_worktree` batch form: `targets` (1–20 items of `name`/`path`,
+  `disposable_paths`, `allow_unmerged`, `fingerprint`) removes several
+  worktrees of one repository in one call. Targets are processed sequentially
+  through the unchanged single-target safety path; every target gets its own
+  line (`removed` / `already_absent` / `refused <codes>` /
+  `outcome_unknown <path>`) plus a `removed=N refused=M unknown=K` summary
+  inside the 8 KiB page budget. An oversized batch is refused as
+  `batch_too_large` before any effect instead of truncated.
+
+### Fixed
+
+- A dispatched removal is never killed by its deadline: on timeout the Git
+  process is detached (finishes in the background, reaped — no zombie) and the
+  reply is `outcome_unknown` naming the path. Removals run under a documented
+  10-minute per-target deadline instead of the 30-second mutation budget.
+- Interrupted-removal rule: a registered worktree differing from HEAD only by
+  deletions of tracked files (merged or `allow_unmerged`, no live process,
+  ignored leftovers only in `disposable_paths`) no longer vetoes `dirty`; the
+  preview warns `resumed_removal` and apply restores the deletions from the
+  index so Git needs no `--force`.
+
 ## 0.1.1
 
 ### Added

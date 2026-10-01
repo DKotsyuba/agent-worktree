@@ -16,10 +16,15 @@ pub const TEMPLATE: &str = include_str!("../../assets/mcp/tools/remove_worktree.
 /// Acknowledgement form used by apply mode.
 pub const RECEIPT_TEMPLATE: &str =
     include_str!("../../assets/mcp/tools/remove_worktree_receipt.txt.j2");
+/// Page form used by batch preview mode.
+pub const BATCH_TEMPLATE: &str =
+    include_str!("../../assets/mcp/tools/remove_worktree_batch.txt.j2");
+/// Page form used by batch apply mode.
+pub const BATCH_RECEIPT_TEMPLATE: &str =
+    include_str!("../../assets/mcp/tools/remove_worktree_batch_receipt.txt.j2");
 
 /// Argument hint used in invalid-arguments refusals.
-const ARGS: &str = "Accepted fields: repo, name?|path?, mode (preview|apply), \
-disposable_paths?, allow_unmerged?, fingerprint? (apply).";
+const ARGS: &str = "Accepted fields: repo, name?|path?, mode (preview|apply), disposable_paths?, allow_unmerged?, fingerprint? (apply); or repo, mode and targets (1-20 items of name?|path?, disposable_paths?, allow_unmerged?, fingerprint?) instead of the single-target fields.";
 
 /// Typed preview view rendered by the embedded template.
 #[derive(Serialize)]
@@ -52,6 +57,46 @@ struct ReceiptView {
     path: String,
     branch: String,
     warnings: Option<String>,
+}
+
+/// One compact line of a batch preview.
+#[derive(Serialize)]
+struct BatchPreviewRowView {
+    key: String,
+    path: String,
+    head: String,
+    branch: String,
+    eligible: bool,
+    vetoes: String,
+    warnings: String,
+    fingerprint: String,
+}
+
+/// Typed batch preview view rendered by the batch page template.
+#[derive(Serialize)]
+struct BatchPreviewView {
+    count: usize,
+    rows: Vec<BatchPreviewRowView>,
+    eligible: usize,
+    refused: usize,
+}
+
+/// One compact line of a batch apply receipt.
+#[derive(Serialize)]
+struct BatchApplyRowView {
+    key: String,
+    outcome: String,
+}
+
+/// Typed batch apply receipt view rendered by the batch receipt template.
+#[derive(Serialize)]
+struct BatchReceiptView {
+    status: &'static str,
+    total: usize,
+    removed: usize,
+    refused: usize,
+    unknown: usize,
+    rows: Vec<BatchApplyRowView>,
 }
 
 /// One veto as a view, with detail only where it carries facts.
@@ -125,18 +170,117 @@ allow_unmerged and this fingerprint."
     }
 }
 
+/// Builds one compact batch preview line view from a service row: the
+/// single-target facts when the target was assessed, or the stable refusal
+/// code when it was not.
+fn batch_preview_row(row: &service::BatchPreviewRow) -> BatchPreviewRowView {
+    match &row.decision {
+        Some(decision) => BatchPreviewRowView {
+            key: row.key.clone(),
+            path: row.path.clone(),
+            head: row.head.clone().unwrap_or_else(|| "unknown".to_owned()),
+            branch: row
+                .branch
+                .as_deref()
+                .map(response::short_branch)
+                .unwrap_or("detached")
+                .to_owned(),
+            eligible: decision.vetoes.is_empty(),
+            vetoes: if decision.vetoes.is_empty() {
+                "-".to_owned()
+            } else {
+                response::bounded(
+                    &decision
+                        .vetoes
+                        .iter()
+                        .map(|veto| {
+                            let view = veto_view(veto);
+                            format!("{}{}", view.code, view.detail)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    240,
+                )
+            },
+            warnings: response::warning_line(&decision.warnings).unwrap_or_else(|| "-".to_owned()),
+            fingerprint: decision
+                .fingerprint
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |f| f.as_str().to_owned()),
+        },
+        None => BatchPreviewRowView {
+            key: row.key.clone(),
+            path: row.path.clone(),
+            head: "unknown".to_owned(),
+            branch: "detached".to_owned(),
+            eligible: false,
+            vetoes: row
+                .refusal
+                .clone()
+                .unwrap_or_else(|| "probe_unknown".to_owned()),
+            warnings: "-".to_owned(),
+            fingerprint: "-".to_owned(),
+        },
+    }
+}
+
+/// Outcome text of one batch apply line.
+fn batch_outcome_text(kind: &service::BatchApplyKind) -> String {
+    match kind {
+        service::BatchApplyKind::Removed => "removed".to_owned(),
+        service::BatchApplyKind::AlreadyAbsent => "already_absent".to_owned(),
+        service::BatchApplyKind::Refused(codes) => format!("refused {codes}"),
+        service::BatchApplyKind::OutcomeUnknown { path } => format!(
+            "outcome_unknown {path} (the removal may still be running; inspect before any retry)"
+        ),
+    }
+}
+
+/// Rust-side batch receipt used when the template fails after a batch ran.
+fn batch_degraded(
+    rows: &[service::BatchApplyRow],
+    removed: usize,
+    refused: usize,
+    unknown: usize,
+) -> String {
+    let mut text = format!(
+        "COMMITTED remove_worktree batch: {} target(s)\n",
+        rows.len()
+    );
+    for row in rows {
+        text.push_str(&format!(
+            "{} | {}\n",
+            row.key,
+            batch_outcome_text(&row.kind)
+        ));
+    }
+    text.push_str(&format!(
+        "Summary: removed={removed} refused={refused} unknown={unknown}\n\
+Presentation: degraded (presentation_failed).\n\
+Do not repeat the removal to repair this response.\n"
+    ));
+    text
+}
+
 pub fn definition() -> Value {
     json!({"name":"remove_worktree",
-        "description":"Remove one worktree. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes it under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. An interrupted apply stays visible through the record's removal_started marker.",
+        "description":"Remove one worktree, or a batch of up to 20 targets of one repository. mode=preview assesses without effect and returns a fingerprint plus vetoes; mode=apply removes under that fingerprint. Never forces and never deletes the branch; dirty, locked, protected or unverified trees are refused. A tree left half-deleted by an interrupted removal (tracked-file deletions only) is resumed, not refused. An interrupted apply stays visible through the record's removal_started marker.",
         "inputSchema":{"type":"object","required":["repo","mode"],
             "properties":{
-                "repo":{"type":"string","description":"Repository root or any worktree inside it."},
+                "repo":{"type":"string","description":"Repository root or any worktree inside it; the single repository every target belongs to."},
                 "name":{"type":"string","description":"Worktree directory name; provide name or path, not both."},
                 "path":{"type":"string","description":"Absolute worktree path; provide name or path, not both."},
                 "mode":{"type":"string","enum":["preview","apply"],"description":"preview assesses; apply removes under the preview fingerprint."},
                 "disposable_paths":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":256},"description":"Ignored paths approved for deletion, worktree-relative (for example target/)."},
                 "allow_unmerged":{"type":"boolean","description":"Explicitly allow removing an unmerged worktree; the branch is retained."},
-                "fingerprint":{"type":"string","maxLength":64,"description":"Fingerprint returned by the preview being applied; required for apply."}},
+                "fingerprint":{"type":"string","maxLength":64,"description":"Fingerprint returned by the preview being applied; required for apply."},
+                "targets":{"type":"array","minItems":1,"maxItems":20,"description":"Batch form: 1-20 targets removed in one call, all in repo. Mutually exclusive with name, path, disposable_paths, allow_unmerged and fingerprint.","items":{"type":"object","required":[],"properties":{
+                    "name":{"type":"string","maxLength":64,"description":"Worktree directory name; provide exactly one of name or path."},
+                    "path":{"type":"string","maxLength":1024,"description":"Absolute worktree path; provide exactly one of name or path."},
+                    "disposable_paths":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":256},"description":"Ignored paths approved for this target's deletion, worktree-relative."},
+                    "allow_unmerged":{"type":"boolean","description":"Explicitly allow removing this unmerged worktree; the branch is retained."},
+                    "fingerprint":{"type":"string","maxLength":64,"description":"Fingerprint returned by this target's preview; required for apply."}},
+                    "additionalProperties":false}}},
             "additionalProperties":false},
         "annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}})
 }
@@ -186,6 +330,59 @@ pub async fn call(args: Value, templates: &Templates, service: &Service) -> Call
                 Err(_) => response::text_result(degraded(status, &key, &path_text), false),
             }
         }
+        Ok(RemoveOutcome::BatchPreview { rows, eligible }) => {
+            let views = rows.iter().map(batch_preview_row).collect::<Vec<_>>();
+            let refused = views.len().saturating_sub(eligible);
+            let view = BatchPreviewView {
+                count: views.len(),
+                rows: views,
+                eligible,
+                refused,
+            };
+            match templates.render("remove_worktree_batch", &view, Class::Page) {
+                Ok(text) => response::text_result(text, false),
+                Err(_) => response::text_result(response::READ_FALLBACK.to_owned(), true),
+            }
+        }
+        Ok(RemoveOutcome::BatchApplied {
+            rows,
+            removed,
+            refused,
+            unknown,
+        }) => {
+            // A batch reply reports every target's own outcome on its line, so
+            // refusals do not make the call an execution error; an unknown
+            // effect does, because it demands reconciliation.
+            let status = if refused > 0 || unknown > 0 {
+                "PARTIAL"
+            } else if removed > 0 {
+                "COMMITTED"
+            } else {
+                "NOOP"
+            };
+            let is_error = unknown > 0;
+            let view = BatchReceiptView {
+                status,
+                total: rows.len(),
+                removed,
+                refused,
+                unknown,
+                rows: rows
+                    .iter()
+                    .map(|row| BatchApplyRowView {
+                        key: row.key.clone(),
+                        outcome: batch_outcome_text(&row.kind),
+                    })
+                    .collect(),
+            };
+            match templates.render("remove_worktree_batch_receipt", &view, Class::Page) {
+                Ok(text) => response::text_result(text, is_error),
+                Err(_) => response::text_result(
+                    batch_degraded(&rows, removed, refused, unknown),
+                    is_error,
+                ),
+            }
+        }
         Err(error) => response::failure(templates, &error),
     }
 }
@@ -201,6 +398,8 @@ mod tests {
         Templates::new(&[
             ("remove_worktree", TEMPLATE),
             ("remove_worktree_receipt", RECEIPT_TEMPLATE),
+            ("remove_worktree_batch", BATCH_TEMPLATE),
+            ("remove_worktree_batch_receipt", BATCH_RECEIPT_TEMPLATE),
             ("error", crate::response::ERROR_TEMPLATE),
             ("outcome_unknown", crate::response::OUTCOME_UNKNOWN_TEMPLATE),
         ])
@@ -312,6 +511,206 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = crate::response::first_text(&result);
         assert!(text.starts_with("ERROR target_required:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn batch_form_passes_argument_validation() {
+        // The batch form itself is well-formed; the failure must come from the
+        // nonexistent repository, not from argument validation.
+        let result = call(
+            serde_json::json!({"repo":"/repo","mode":"preview",
+                "targets":[{"name":"task-1"},{"path":"/w/task-2"}]}),
+            &templates(),
+            &Service::new().unwrap(),
+        )
+        .await;
+        let text = crate::response::first_text(&result);
+        for refused in [
+            "ERROR invalid_arguments",
+            "ERROR targets_conflict",
+            "ERROR targets_invalid",
+            "ERROR target_required",
+            "ERROR fingerprint_required",
+        ] {
+            assert!(!text.starts_with(refused), "{text}");
+        }
+        assert!(text.starts_with("ERROR "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn batch_conflicts_with_single_target_fields() {
+        for extra in [
+            serde_json::json!({"name":"task-1"}),
+            serde_json::json!({"path":"/w/task-1"}),
+            serde_json::json!({"disposable_paths":["target"]}),
+            serde_json::json!({"allow_unmerged":true}),
+            serde_json::json!({"fingerprint":"0".repeat(64)}),
+        ] {
+            let mut args = serde_json::json!({"repo":"/repo","mode":"preview",
+                "targets":[{"name":"task-1"}]});
+            let object = args.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            let result = call(args, &templates(), &Service::new().unwrap()).await;
+            let text = crate::response::first_text(&result);
+            assert!(text.starts_with("ERROR targets_conflict:"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_target_count_and_shape_validated() {
+        let templates = templates();
+        let service = Service::new().unwrap();
+        // Empty and over-20 batches refuse.
+        for (label, count) in [("empty", 0), ("too many", 21)] {
+            let targets: Vec<_> = (0..count)
+                .map(|index| serde_json::json!({"name": format!("task-{index}")}))
+                .collect();
+            let result = call(
+                serde_json::json!({"repo":"/repo","mode":"preview","targets":targets}),
+                &templates,
+                &service,
+            )
+            .await;
+            let text = crate::response::first_text(&result);
+            assert!(
+                text.starts_with("ERROR targets_invalid:"),
+                "{label}: {text}"
+            );
+        }
+        // A target with both or neither of name and path refuses.
+        for target in [
+            serde_json::json!({"name":"a","path":"/w/a"}),
+            serde_json::json!({"disposable_paths":["target"]}),
+        ] {
+            let result = call(
+                serde_json::json!({"repo":"/repo","mode":"preview","targets":[target]}),
+                &templates,
+                &service,
+            )
+            .await;
+            let text = crate::response::first_text(&result);
+            assert!(text.starts_with("ERROR targets_invalid:"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_apply_requires_every_targets_fingerprint() {
+        let result = call(
+            serde_json::json!({"repo":"/repo","mode":"apply",
+                "targets":[{"name":"task-1","fingerprint":"0".repeat(64)},
+                    {"name":"task-2"}]}),
+            &templates(),
+            &Service::new().unwrap(),
+        )
+        .await;
+        let text = crate::response::first_text(&result);
+        assert!(text.starts_with("ERROR fingerprint_required:"), "{text}");
+        assert!(text.contains("target 2"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn oversized_batch_is_refused_before_any_effect() {
+        let long = format!("/w/{}", "d".repeat(600));
+        let targets: Vec<_> = (0..20)
+            .map(|_| serde_json::json!({"path": &long}))
+            .collect();
+        let result = call(
+            serde_json::json!({"repo":"/repo","mode":"apply","targets":targets}),
+            &templates(),
+            &Service::new().unwrap(),
+        )
+        .await;
+        let text = crate::response::first_text(&result);
+        assert!(text.starts_with("ERROR batch_too_large:"), "{text}");
+        assert!(text.contains("smaller batch"), "{text}");
+    }
+
+    #[test]
+    fn batch_templates_render_compact_lines() {
+        let fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let preview = BatchPreviewView {
+            count: 2,
+            rows: vec![
+                BatchPreviewRowView {
+                    key: "0123456789ab/task-1".to_owned(),
+                    path: "/w/demo--0123456789ab/task-1".to_owned(),
+                    head: "0f1e".to_owned(),
+                    branch: "aw/task-1".to_owned(),
+                    eligible: true,
+                    vetoes: "-".to_owned(),
+                    warnings: "-".to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                },
+                BatchPreviewRowView {
+                    key: "0123456789ab/task-2".to_owned(),
+                    path: "/w/demo--0123456789ab/task-2".to_owned(),
+                    head: "0f1e".to_owned(),
+                    branch: "aw/task-2".to_owned(),
+                    eligible: false,
+                    vetoes: "untracked_files".to_owned(),
+                    warnings: "-".to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                },
+            ],
+            eligible: 1,
+            refused: 1,
+        };
+        let text = templates()
+            .render("remove_worktree_batch", &preview, Class::Page)
+            .unwrap();
+        assert!(text.starts_with("PREVIEW remove_worktree batch: 2 target(s)\n"));
+        assert!(text.contains("/task-1 | /w/demo--0123456789ab/task-1 | head=0f1e"));
+        assert!(text.contains("eligible=true | vetoes=- |"));
+        assert!(text.contains("eligible=false | vetoes=untracked_files |"));
+        assert!(text.ends_with("Summary: eligible=1 refused=1\n"));
+
+        let receipt = BatchReceiptView {
+            status: "PARTIAL",
+            total: 2,
+            removed: 1,
+            refused: 1,
+            unknown: 0,
+            rows: vec![
+                BatchApplyRowView {
+                    key: "0123456789ab/task-1".to_owned(),
+                    outcome: "removed".to_owned(),
+                },
+                BatchApplyRowView {
+                    key: "0123456789ab/task-2".to_owned(),
+                    outcome: "refused untracked_files".to_owned(),
+                },
+            ],
+        };
+        let text = templates()
+            .render("remove_worktree_batch_receipt", &receipt, Class::Page)
+            .unwrap();
+        assert!(text.starts_with("PARTIAL remove_worktree batch: 2 target(s)\n"));
+        assert!(text.contains("/task-1 | removed\n"));
+        assert!(text.contains("/task-2 | refused untracked_files\n"));
+        assert!(text.ends_with("Summary: removed=1 refused=1 unknown=0\n"));
+    }
+
+    #[test]
+    fn degraded_batch_receipt_keeps_every_line() {
+        let rows = vec![
+            service::BatchApplyRow {
+                key: "ab12/task-1".to_owned(),
+                kind: service::BatchApplyKind::Removed,
+            },
+            service::BatchApplyRow {
+                key: "ab12/task-2".to_owned(),
+                kind: service::BatchApplyKind::OutcomeUnknown {
+                    path: "/w/task-2".to_owned(),
+                },
+            },
+        ];
+        let text = batch_degraded(&rows, 1, 0, 1);
+        assert!(text.contains("ab12/task-1 | removed\n"));
+        assert!(text.contains("ab12/task-2 | outcome_unknown /w/task-2"));
+        assert!(text.contains("Summary: removed=1 refused=0 unknown=1"));
+        assert!(text.contains("Do not repeat the removal"));
     }
 
     #[test]

@@ -117,7 +117,14 @@ total.
 
 ## Removal
 
-Removal is preview → fingerprint → apply, one worktree at a time.
+Removal is preview → fingerprint → apply, one worktree at a time or as a batch
+of up to 20 targets of one repository (`targets`, mutually exclusive with the
+single-target fields). A batch processes targets sequentially, each through
+exactly the single-target safety path; a refusal or failure of one target never
+stops, hides or rolls back the others, and the reply carries one compact line
+per target plus a summary (`removed=N refused=M unknown=K`) inside the page
+budget — a batch whose lines cannot fit is refused as `batch_too_large` before
+any effect, never truncated.
 
 The preview returns the exact path, HEAD, branch, observed risks, the proposed
 discarded ignored paths (`disposable_paths`, explicit and relative to the
@@ -142,6 +149,15 @@ Apply recomputes everything under the repository lock, writes
 - unmerged HEAD, unless the request sets `allow_unmerged` explicitly — by owner
   decision unmerged copies are not removed by default, and an explicit
   confirmation keeps agents from reaching for `--force`.
+
+Interrupted-removal rule: a registered worktree that differs from HEAD only
+through worktree-side deletions of tracked files — no untracked, staged,
+modified, renamed or conflicted entries, ignored leftovers only within
+`disposable_paths` — with HEAD merged into the integration ref (or
+`allow_unmerged`) and no live process, is a half-finished removal this product
+may finish: no `dirty` veto, the warning `resumed_removal`, and apply restores
+the deletions from the index before `git worktree remove`, so Git never needs
+`--force`. Anything else keeps the vetoes above.
 
 Git is never passed `--force`, and the branch is always retained (commits are
 never lost). Deletion is permanent; quarantine/trash was rejected because copies
@@ -175,7 +191,11 @@ Every Git invocation runs with a per-call deadline and output cap, NUL-separated
 parsing, `-c core.hooksPath=<empty dir> -c core.fsmonitor=false`, and the
 environment `GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0`. The server never
 fetches and never relies on interactive prompts. A timeout or cancellation after
-a mutation was dispatched is `outcome_unknown`, never an automatic replay.
+a mutation was dispatched is `outcome_unknown`, never an automatic replay. A
+dispatched mutation is never killed by its deadline — killing `git worktree
+remove` mid-delete would leave a half-deleted tree that then vetoes itself as
+dirty — so on timeout the subprocess is detached, finishes in the background
+and is reaped; reads keep kill-on-timeout.
 
 ## Budgets
 
@@ -186,9 +206,12 @@ activity), and mergedness is one bounded `merge-base` per row against the
 derived integration ref; rows whose pass misses the shared page budget report
 `unknown`. Size is measured only on request, for the page's rows. Inspection
 bounds each expensive probe and the total pass; mutations (create, remove,
-prune) have a 30-second deadline including lock waits and verification. List
-pages are keyset-paginated with at most 20 rows: the cursor is scope plus last
-key, with no stored snapshots. Response budgets follow
+prune) have a 30-second deadline including lock waits and verification — except
+removals, which run under a documented 10-minute deadline per target
+(`REMOVE_MUTATION_SECS`), per target inside a batch too, because deleting a
+multi-GiB tree can outgrow 30 seconds and the removal is never killed mid-run.
+List pages are keyset-paginated with at most 20 rows: the cursor is scope plus
+last key, with no stored snapshots. Response budgets follow
 `docs/MCP_RESPONSE_STANDARD.md`.
 
 ## Tools
@@ -199,7 +222,7 @@ key, with no stored snapshots. Response budgets follow
 | `create_worktree` | external-write | repo, name, base, branch/detached; returns exact id/path/ref; conflicts never overwrite |
 | `list_worktrees` | read | repo/scope, cursor, limit ≤ 20; inventory with advice and coverage |
 | `inspect_worktree` | read | by id or path; bounded evidence, partial when probes degrade |
-| `remove_worktree` | external-write | preview or apply(fingerprint); `disposable_paths`, `allow_unmerged`; ≤ 2 KiB receipt |
+| `remove_worktree` | external-write | preview or apply(fingerprint), single target or a `targets` batch of ≤ 20 in one repo; `disposable_paths`, `allow_unmerged`; ≤ 2 KiB receipt, ≤ 8 KiB batch page |
 | `prune_worktrees` | external-write | `{repo, dry_run}`; repository-scope preview or receipt |
 
 ## Presentation and delivery

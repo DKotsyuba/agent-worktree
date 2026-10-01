@@ -413,9 +413,17 @@ pub enum RemoveOutcome {
 /// Callers MUST veto ignored files outside the approved disposable paths
 /// before dispatch: Git itself happily removes a worktree whose only content
 /// is ignored files, so this function cannot be the guard for them.
+///
+/// When `resume_interrupted` is true, the caller has assessed the tree as an
+/// interrupted removal (worktree-side deletions only, verified under the
+/// expected fingerprint): those deletions are first restored from the index
+/// with `git restore --worktree -- .` so Git accepts the removal without
+/// `--force`. Restoring deletions loses no work — the content comes back from
+/// the index and the whole tree is being removed anyway.
 pub async fn remove(
     common_dir: &Path,
     worktree_path: &Path,
+    resume_interrupted: bool,
     budget: &Budget,
 ) -> Result<RemoveOutcome, GitError> {
     let registrations = inventory(common_dir, budget).await?;
@@ -425,6 +433,14 @@ pub async fn remove(
         .any(|candidate| same_tree(&candidate.path, &target, worktree_path));
     if !registered && std::fs::symlink_metadata(worktree_path).is_err() {
         return Ok(RemoveOutcome::AlreadyAbsent);
+    }
+    if resume_interrupted {
+        let mut args = s(&["restore", "--worktree", "--"]);
+        args.push(OsString::from("."));
+        let out = run_git(&args, Some(worktree_path), budget, Op::Mutation).await?;
+        if !out.status.success() {
+            return Err(git_failure("git restore", &out));
+        }
     }
     let mut args = s(&["worktree", "remove"]);
     args.push(p(worktree_path));
@@ -717,11 +733,20 @@ async fn run_git(
     run_captured("git", &argv, cwd, budget, op).await
 }
 
-/// Runs one bounded subprocess: deadline, output cap and kill on drop.
+/// Runs one bounded subprocess: deadline, output cap, and kill or detach on
+/// deadline depending on the operation class.
 ///
 /// Repository-selecting `GIT_*` variables inherited from this process are
 /// removed: with, say, `GIT_DIR` exported by the caller's environment, every
 /// invocation would silently bind to the wrong repository.
+///
+/// The child is owned by a detached task that reads its pipes and waits for
+/// its exit, so it is always reaped and never becomes a zombie. A read that
+/// misses the deadline aborts that task, which drops the child and kills it.
+/// A dispatched mutation is never killed by our deadline — killing
+/// `git worktree remove` mid-delete leaves a half-deleted tree that then
+/// vetoes itself as dirty — so it keeps running in the background and the
+/// caller reports `outcome_unknown` naming the path to inspect.
 async fn run_captured(
     program: &str,
     argv: &[OsString],
@@ -770,34 +795,43 @@ async fn run_captured(
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
     let cap = budget.max_output_bytes;
-    let work = async {
-        let (stdout, stderr) = tokio::join!(
-            read_capped(stdout_pipe.as_mut(), cap),
-            read_capped(stderr_pipe.as_mut(), cap)
-        );
-        let streams = match (stdout, stderr) {
-            (Ok(out), Ok(err)) => (out, err),
-            (Err(error), _) | (_, Err(error)) => return Err(error),
-        };
-        let status = child.wait().await.map_err(|error| {
-            GitError::new(
-                GitErrorCode::ExecutionFailed,
-                format!("{program} wait failed: {error}"),
-            )
-        })?;
-        Ok((streams.0, streams.1, status))
-    };
-    match timeout(ttl, work).await {
-        Ok(Ok((stdout, stderr, status))) => Ok(RunOutput {
+    let program_owned = program.to_owned();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        let result = async {
+            let (stdout, stderr) = tokio::join!(
+                read_capped(stdout_pipe.as_mut(), cap),
+                read_capped(stderr_pipe.as_mut(), cap)
+            );
+            let streams = match (stdout, stderr) {
+                (Ok(out), Ok(err)) => (out, err),
+                (Err(error), _) | (_, Err(error)) => return Err(error),
+            };
+            let status = child.wait().await.map_err(|error| {
+                GitError::new(
+                    GitErrorCode::ExecutionFailed,
+                    format!("{program_owned} wait failed: {error}"),
+                )
+            })?;
+            Ok((streams.0, streams.1, status))
+        }
+        .await;
+        // The receiver is gone when the caller already returned; the child is
+        // still waited for here, so a detached mutation is reaped, no zombie.
+        let _ = tx.send(result);
+    });
+    match timeout(ttl, rx).await {
+        Ok(Ok(Ok((stdout, stderr, status)))) => Ok(RunOutput {
             status,
             stdout,
             stderr,
         }),
-        Ok(Err(error)) => {
-            // The child is killed when it is dropped with the async block.
-            // Anything failing after spawn (pipe read, cap, wait) may already
-            // have taken effect for a mutation, so mutations never report a
-            // definite read-style failure here.
+        Ok(Ok(Err(error))) => {
+            // The worker ended after spawn with a pipe or wait failure. The
+            // child exited on its own, so reads report the failure as-is;
+            // anything failing after spawn may still have taken effect for a
+            // mutation, so mutations never report a definite read-style
+            // failure here.
             let code = if op == Op::Mutation {
                 GitErrorCode::OutcomeUnknown
             } else {
@@ -808,13 +842,27 @@ async fn run_captured(
                 detail: format!("{program}: {}", error.detail),
             })
         }
-        Err(_) => Err(GitError::new(
-            match op {
-                Op::Read => GitErrorCode::Timeout,
-                Op::Mutation => GitErrorCode::OutcomeUnknown,
-            },
-            format!("{program} exceeded the operation deadline"),
+        // The worker ended without delivering a result; the child was reaped.
+        Ok(Err(_lost)) => Err(GitError::new(
+            GitErrorCode::ExecutionFailed,
+            format!("{program} produced no subprocess result"),
         )),
+        Err(_elapsed) => match op {
+            Op::Read => {
+                worker.abort();
+                Err(GitError::new(
+                    GitErrorCode::Timeout,
+                    format!("{program} exceeded the operation deadline"),
+                ))
+            }
+            Op::Mutation => Err(GitError::new(
+                GitErrorCode::OutcomeUnknown,
+                format!(
+                    "{program} exceeded the operation deadline and was not \
+                     killed; it may still be running and must be inspected"
+                ),
+            )),
+        },
     }
 }
 
@@ -1115,6 +1163,7 @@ fn parse_status(bytes: &[u8]) -> StatusParse {
         conflicts: 0,
         ignored: Vec::new(),
         digest: hex_digest(bytes),
+        worktree_deletions_only: true,
     };
     let mut submodules = SubmoduleFacts {
         dirty: false,
@@ -1126,8 +1175,13 @@ fn parse_status(bytes: &[u8]) -> StatusParse {
         }
         let sub = token.get(5..9).filter(|field| field.len() == 4);
         match token[0] {
-            // `1 <XY> <sub> ...` and `2 <XY> <sub> ... <path>[\t<orig>]`
+            // `1 <XY> <sub> ...` and `2 <XY> <sub> ... <path> (tab-orig)`
             b'1' | b'2' => {
+                // Only an unstaged worktree-side deletion (`1 .D`) keeps the
+                // deletions-only signature; a staged entry, a modification or
+                // a rename breaks it.
+                facts.worktree_deletions_only &=
+                    token[0] == b'1' && token[2] == b'.' && token[3] == b'D';
                 if token.len() >= 4 {
                     if token[2] != b'.' {
                         facts.staged += 1;
@@ -1149,19 +1203,25 @@ fn parse_status(bytes: &[u8]) -> StatusParse {
             // `u <XY> <sub> ...` unmerged entries
             b'u' => {
                 facts.conflicts += 1;
+                facts.worktree_deletions_only = false;
                 if sub.is_some_and(|field| field[0] == b'S') {
                     submodules.dirty = true;
                     submodules.unsupported = true;
                 }
             }
-            b'?' => facts.untracked += 1,
+            b'?' => {
+                facts.untracked += 1;
+                facts.worktree_deletions_only = false;
+            }
             b'!' if token.len() > 2 => {
                 facts
                     .ignored
                     .push(String::from_utf8_lossy(&token[2..]).into_owned());
             }
-            // Unknown record kinds are ignored for forward compatibility.
-            _ => {}
+            // Unknown record kinds are ignored for forward compatibility,
+            // but they void the deletions-only signature: a kind this parser
+            // does not understand is never proof of an interrupted removal.
+            _ => facts.worktree_deletions_only = false,
         }
     }
     StatusParse { facts, submodules }
@@ -1344,6 +1404,37 @@ mod tests {
         assert_eq!(parsed.facts.digest.len(), 64);
         assert!(parsed.submodules.dirty);
         assert!(!parsed.submodules.unsupported);
+    }
+
+    #[test]
+    fn status_parser_tracks_the_deletions_only_signature() {
+        // Worktree-side deletions only: the interrupted-removal signature.
+        let deletions = b"# branch.oid abc\0# branch.head main\0\
+                          1 .D N... 100644 100644 100644 h h a\0\
+                          1 .D N... 100644 100644 100644 h h b\0";
+        let parsed = parse_status(deletions);
+        assert_eq!(parsed.facts.unstaged, 2);
+        assert!(parsed.facts.worktree_deletions_only);
+
+        // A modification, a staged entry, a rename, an untracked file, a
+        // conflict and an unknown record kind each break the signature.
+        for bytes in [
+            b"1 .M N... 100644 100644 100644 h h a\0".as_slice(),
+            b"1 D. N... 100644 100644 100644 h h a\0".as_slice(),
+            b"2 R. N... 100644 100644 100644 h h R100 a\0".as_slice(),
+            b"1 .D N... 100644 100644 100644 h h a\0? u.txt\0".as_slice(),
+            b"1 .D N... 100644 100644 100644 h h a\0u AA N... 100644 h h h m\0".as_slice(),
+            b"1 .D N... 100644 100644 100644 h h a\0x newkind\0".as_slice(),
+        ] {
+            assert!(
+                !parse_status(bytes).facts.worktree_deletions_only,
+                "signature must break: {}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        // Ignored entries do not affect the signature.
+        let ignored = b"1 .D N... 100644 100644 100644 h h a\0! ign/\0";
+        assert!(parse_status(ignored).facts.worktree_deletions_only);
     }
 
     #[test]
@@ -1686,7 +1777,7 @@ mod tests {
         let cd = common_dir(&main, &budget_secs(30)).await.unwrap();
 
         std::fs::write(wt.join("u.txt"), "u\n").unwrap();
-        let error = remove(&cd, &wt, &budget_secs(60)).await.unwrap_err();
+        let error = remove(&cd, &wt, false, &budget_secs(60)).await.unwrap_err();
         assert_eq!(error.code, GitErrorCode::Conflict);
         assert!(
             error.detail.contains("untracked"),
@@ -1695,7 +1786,7 @@ mod tests {
 
         std::fs::remove_file(wt.join("u.txt")).unwrap();
         assert_eq!(
-            remove(&cd, &wt, &budget_secs(60)).await.unwrap(),
+            remove(&cd, &wt, false, &budget_secs(60)).await.unwrap(),
             RemoveOutcome::Removed
         );
         assert!(!wt.exists());
@@ -1706,8 +1797,33 @@ mod tests {
                 .success()
         );
         assert_eq!(
-            remove(&cd, &wt, &budget_secs(60)).await.unwrap(),
+            remove(&cd, &wt, false, &budget_secs(60)).await.unwrap(),
             RemoveOutcome::AlreadyAbsent
+        );
+    }
+
+    /// An interrupted removal leaves deletions only; resuming restores them
+    /// from the index so Git removes the tree without `--force`.
+    #[tokio::test]
+    async fn remove_resumes_an_interrupted_removal() {
+        let _env = env_guard();
+        let (dir, main) = repo_with_commit();
+        let wt = dir.path().join("wt");
+        add_worktree(&main, &wt, &[]);
+        let cd = common_dir(&main, &budget_secs(30)).await.unwrap();
+
+        std::fs::remove_file(wt.join("a.txt")).unwrap();
+        std::fs::remove_file(wt.join(".gitignore")).unwrap();
+        assert_eq!(
+            remove(&cd, &wt, true, &budget_secs(60)).await.unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert!(!wt.exists());
+        // The branch survives the resumed removal; commits are never lost.
+        assert!(
+            sync_git(&main, &["rev-parse", "--verify", "refs/heads/wt"])
+                .status
+                .success()
         );
     }
 
@@ -1888,7 +2004,7 @@ mod tests {
         // Git removes ignored-only worktrees without --force; the caller-side
         // IgnoredNotDisposable veto is the only guard, as documented on remove.
         assert_eq!(
-            remove(&cd, &wt, &budget_secs(60)).await.unwrap(),
+            remove(&cd, &wt, false, &budget_secs(60)).await.unwrap(),
             RemoveOutcome::Removed
         );
         assert!(!wt.exists());

@@ -305,6 +305,7 @@ mod tests {
                 conflicts: 0,
                 ignored: vec!["target/".to_owned()],
                 digest: "cafe01".to_owned(),
+                worktree_deletions_only: false,
             }),
             submodules: Probe::NotChecked,
             integration: Probe::Known(Integration::Unmerged),
