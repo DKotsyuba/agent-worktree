@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.2
+
 ### Added
 
 - `remove_worktree` batch form: `targets` (1–20 items of `name`/`path`,
