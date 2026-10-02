@@ -218,6 +218,8 @@ multi-GiB tree can outgrow 30 seconds and the removal is never killed mid-run.
 List pages are keyset-paginated with at most 20 rows: the cursor is scope plus
 last key, with no stored snapshots. Response budgets follow
 `docs/MCP_RESPONSE_STANDARD.md`.
+`tools/list` adds `ttlMs` (60 s) and `cacheScope: private` only for requests
+that negotiated MCP 2026-07-28 or later; legacy sessions get neither.
 
 ## Tools
 

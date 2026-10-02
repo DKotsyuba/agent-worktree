@@ -134,21 +134,31 @@ impl Handler {
         })
     }
 }
+/// Private catalog cache lifetime in milliseconds for modern MCP requests.
+const TOOLS_LIST_TTL_MS: u64 = 60_000;
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions("Tools: get_status, create_worktree, list_worktrees, inspect_worktree, remove_worktree, prune_worktrees; tool descriptions define effects. Removal is always preview → fingerprint → apply and refuses anything not provably clean. Git is never forced and branches are never deleted.")
     }
+    /// Return the static catalog; modern requests cache it privately for 60 seconds.
+    /// Pagination is unused; legacy sessions retain their original wire fields.
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            tools: self.catalog.clone(),
-            ..Default::default()
-        })
+        let mut result = ListToolsResult::with_all_items(self.catalog.clone());
+        if context
+            .protocol_version()
+            .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
+        {
+            result = result
+                .with_ttl_ms(TOOLS_LIST_TTL_MS)
+                .with_cache_scope(CacheScope::Private);
+        }
+        Ok(result)
     }
     async fn call_tool(
         &self,

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- `tools/list` carries `ttlMs`/`cacheScope` for MCP 2026-07-28 clients; Claude
+  Code saw zero tools. Legacy sessions are unchanged.
+
 ## 0.1.2
 
 ### Added
