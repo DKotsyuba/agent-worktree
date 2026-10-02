@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-worktree"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "family-delivery",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "family-delivery"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "fs2",
  "serde",
@@ -482,7 +482,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mcp-presentation"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "minijinja",
  "serde",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "family-delivery",

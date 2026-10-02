@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.3
+
 ### Fixed
 
 - `tools/list` carries `ttlMs`/`cacheScope` for MCP 2026-07-28 clients; Claude
