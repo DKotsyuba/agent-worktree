@@ -1824,3 +1824,233 @@ async fn two_concurrent_hooks_announce_exactly_once() {
     .await
     .expect("e2e deadline");
 }
+
+/// Calls one tool and returns the full wire result JSON, so tests can assert
+/// both the text block and the structured content a host would receive.
+async fn call_wire(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    name: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    let name = name.to_owned();
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    serde_json::to_value(&result).unwrap()
+}
+
+/// Snapshots every product-side file (config and state) as relative path plus
+/// bytes, so a read can be proven not to add records or rewrite anything.
+fn product_snapshot(home: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let relative = path.strip_prefix(base).unwrap().display().to_string();
+                out.push((relative, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(home, &home.join("product"), &mut out);
+    out.sort();
+    out
+}
+
+/// Snapshots the Git facts a read must never touch: registrations and refs.
+fn git_facts(repo: &std::path::Path) -> String {
+    let run = |args: &[&str]| {
+        String::from_utf8(
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+    };
+    format!(
+        "{}|{}",
+        run(&["worktree", "list", "--porcelain"]),
+        run(&["for-each-ref"])
+    )
+}
+
+/// The additive read contract over real repositories: structured twins beside
+/// unchanged text, canonical repository identity shared by linked worktrees,
+/// cursor preservation across a real page walk, and reads that add no records
+/// and mutate no Git or product state.
+#[tokio::test]
+async fn structured_read_contract() {
+    let f = fixture().await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let repo = f.repo.display().to_string();
+        for name in ["task-1", "task-2"] {
+            let (error, text) = call_text(
+                &f._client,
+                "create_worktree",
+                serde_json::json!({"repo": repo, "name": name, "creator": "claude-code",
+                    "purpose": "hub reads"}),
+            )
+            .await;
+            assert!(!error, "{text}");
+        }
+        // Baselines taken after the writes: reads must not move them.
+        let before_state = product_snapshot(f.home.path());
+        let before_git = git_facts(&f.repo);
+
+        // Identity twin beside the one text block.
+        let wire = call_wire(&f._client, "get_status", serde_json::json!({})).await;
+        assert_eq!(wire["content"].as_array().unwrap().len(), 1);
+        assert_eq!(wire["structuredContent"]["schema_version"], 1);
+        assert_eq!(wire["structuredContent"]["kind"], "identity");
+        assert_eq!(
+            wire["structuredContent"]["data"]["product"],
+            "agent-worktree"
+        );
+        assert!(wire["structuredContent"]["data"]["version"].is_string());
+
+        // Keyset pagination: walk every page through the structured cursor and
+        // confirm it matches the text page and never repeats or skips a row.
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..5 {
+            let mut args = serde_json::json!({"repo": repo, "limit": 1});
+            if let Some(current) = &cursor {
+                args["cursor"] = serde_json::json!(current);
+            }
+            let wire = call_wire(&f._client, "list_worktrees", args).await;
+            assert_eq!(wire["isError"], false, "{wire}");
+            let data = &wire["structuredContent"]["data"];
+            assert_eq!(data["returned"], 1);
+            let text = wire["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with("OK worktrees: 1 returned; more="),
+                "{text}"
+            );
+            let key = data["rows"][0]["key"].as_str().unwrap().to_owned();
+            assert!(!seen.contains(&key), "row repeated across pages: {key}");
+            seen.push(key);
+            let wire_cursor = data["cursor"].as_str().map(str::to_owned);
+            assert_eq!(wire_cursor.is_some(), data["has_more"], "{data}");
+            if let Some(current) = &wire_cursor {
+                assert!(text.contains(&format!("Cursor: {current}")), "{text}");
+            }
+            cursor = wire_cursor;
+            if data["has_more"] != true {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 3, "expected main plus two worktrees: {seen:?}");
+
+        // One full page: linked worktrees share canonical repository identity;
+        // every row is typed and null where the page pass did not probe.
+        let wire = call_wire(
+            &f._client,
+            "list_worktrees",
+            serde_json::json!({"repo": repo, "size": true}),
+        )
+        .await;
+        let data = &wire["structuredContent"]["data"];
+        assert_eq!(data["returned"], 3);
+        let rows = data["rows"].as_array().unwrap();
+        let main = rows.iter().find(|r| r["class"] == "main").unwrap();
+        let managed: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["class"] == "managed").collect();
+        assert_eq!(managed.len(), 2);
+        let repo_id = main["repo_id"].as_str().unwrap();
+        assert_eq!(repo_id.len(), 64, "{main}");
+        for row in &managed {
+            assert_eq!(row["repo_id"], repo_id, "linked worktrees share identity");
+            assert_eq!(row["repo_common_dir"], main["repo_common_dir"]);
+            assert!(
+                row["repo_common_dir"].as_str().unwrap().ends_with("/.git"),
+                "{row}"
+            );
+            assert_eq!(row["removal_started"], false);
+            assert_eq!(row["creator"], "claude-code");
+            assert_eq!(
+                row["branch"],
+                format!(
+                    "refs/heads/aw/{}",
+                    row["key"].as_str().unwrap().split('/').nth(1).unwrap()
+                )
+            );
+            assert_eq!(row["detached"], false);
+            assert_eq!(row["activity"]["mtime_based"], true);
+            assert!(
+                row["size"]["bytes"].as_u64().is_some_and(|b| b > 0),
+                "{row}"
+            );
+            assert!(
+                ["complete", "lower_bound"].contains(&row["size"]["quality"].as_str().unwrap()),
+                "{row}"
+            );
+        }
+
+        // Detail: independent probe states, record revision, observation time.
+        let wire = call_wire(
+            &f._client,
+            "inspect_worktree",
+            serde_json::json!({"repo": repo, "name": "task-1"}),
+        )
+        .await;
+        assert_eq!(wire["isError"], false, "{wire}");
+        let data = &wire["structuredContent"]["data"];
+        assert_eq!(wire["structuredContent"]["kind"], "worktree_detail");
+        assert_eq!(data["repo_id"], repo_id);
+        assert_eq!(data["repo_common_dir"], main["repo_common_dir"]);
+        assert_eq!(data["class"], "managed");
+        let probes = &data["probes"];
+        assert_eq!(probes["status"]["state"], "known");
+        assert_eq!(probes["status"]["value"]["untracked"], 0);
+        assert_eq!(probes["integration"]["state"], "known");
+        assert_eq!(probes["integration"]["value"], "ancestor_merged");
+        assert_eq!(probes["processes"]["state"], "known");
+        assert_eq!(probes["processes"]["value"], false);
+        assert_eq!(probes["submodules"]["state"], "not_checked");
+        assert!(probes["submodules"]["value"].is_null());
+        assert_eq!(probes["size"]["state"], "not_checked");
+        assert!(data["observed_at"].as_u64().is_some_and(|t| t > 0));
+        assert!(data["record"]["revision"].as_u64().is_some_and(|r| r >= 1));
+        assert!(data["record"]["removal_started"].is_null());
+        assert_eq!(data["hygiene"]["missing"], false);
+
+        // Probes that were not requested stay missing even when others ran.
+        let wire = call_wire(
+            &f._client,
+            "inspect_worktree",
+            serde_json::json!({"repo": repo, "name": "task-1", "checks": {"status": true}}),
+        )
+        .await;
+        let probes = &wire["structuredContent"]["data"]["probes"];
+        assert_eq!(probes["status"]["state"], "known");
+        assert_eq!(probes["integration"]["state"], "not_checked");
+        assert_eq!(probes["processes"]["state"], "not_checked");
+
+        // A refused read is a structured error under the same output schema.
+        let wire = call_wire(
+            &f._client,
+            "inspect_worktree",
+            serde_json::json!({"repo": repo, "name": "absent"}),
+        )
+        .await;
+        assert_eq!(wire["isError"], true);
+        assert!(wire["structuredContent"].get("data").is_none());
+        assert_eq!(wire["structuredContent"]["error"]["code"], "not_found");
+
+        // The reads added no records and touched no Git registration or ref.
+        assert_eq!(product_snapshot(f.home.path()), before_state, "state moved");
+        assert_eq!(git_facts(&f.repo), before_git, "Git facts moved");
+
+        f._client.cancel().await.unwrap();
+    })
+    .await
+    .expect("e2e deadline");
+}

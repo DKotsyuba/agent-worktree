@@ -129,6 +129,219 @@ pub fn text_result(text: String, is_error: bool) -> CallToolResult {
     result
 }
 
+/// Outer-envelope version of the additive machine-readable read contract
+/// (`schema_version` in `structuredContent`). Bumped only by a compatibility
+/// review, never by a layout-only change.
+pub const READ_SCHEMA_VERSION: u32 = 1;
+
+/// Bounded structured failure outcome; mirrors [`ErrorView`] without prose
+/// authority. Carries a stable code, the execution outcome class and a bounded
+/// detail — never raw config, process arguments or credentials.
+#[derive(Serialize)]
+pub struct ReadErrorDto {
+    /// Stable snake_case error code, identical to the one in the text form.
+    pub code: String,
+    /// Execution outcome class: `blocked`, `unavailable` or `outcome_unknown`.
+    pub outcome: &'static str,
+    /// Bounded human-readable detail (already capped by the service layer).
+    pub detail: String,
+    /// Optional single safe recovery step, or `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// Stable label for a service outcome class, shared by every structured error.
+#[must_use]
+pub fn outcome_label(outcome: ServiceOutcome) -> &'static str {
+    match outcome {
+        ServiceOutcome::Blocked => "blocked",
+        ServiceOutcome::Unavailable => "unavailable",
+        ServiceOutcome::OutcomeUnknown => "outcome_unknown",
+    }
+}
+
+/// Typed outer envelope of the read contract: `schema_version` and `kind`
+/// always, then exactly one of `data` (successful read) or `error` (typed
+/// failure); the absent branch is omitted, never a misleading `null`.
+#[derive(Serialize)]
+struct ReadEnvelope<'a> {
+    schema_version: u32,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ReadErrorDto>,
+}
+
+/// Builds the outer read envelope for `structuredContent`. A failed read is
+/// therefore never representable as an empty success.
+#[must_use]
+pub fn read_envelope(
+    kind: &str,
+    data: Option<serde_json::Value>,
+    error: Option<ReadErrorDto>,
+) -> serde_json::Value {
+    serde_json::to_value(ReadEnvelope {
+        schema_version: READ_SCHEMA_VERSION,
+        kind,
+        data,
+        error,
+    })
+    .unwrap_or_else(|_| serde_json::json!({"schema_version": READ_SCHEMA_VERSION, "kind": kind}))
+}
+
+/// Attaches structured content conforming to the tool's declared
+/// `outputSchema`; the single text block and `isError` stay unchanged.
+#[must_use]
+pub fn with_structured(
+    mut result: CallToolResult,
+    structured: serde_json::Value,
+) -> CallToolResult {
+    result.structured_content = Some(structured);
+    result
+}
+
+/// Builds a tool `outputSchema` around one tool-specific data schema: the
+/// outer read envelope (`schema_version`, `kind`, exactly one of `data` or
+/// `error`), so a failed read conforms through the `error` branch. A `$defs`
+/// object nested in the data schema is hoisted to the document root, because
+/// `#/$defs/…` references resolve from there.
+#[must_use]
+pub fn read_schema(kind: &str, data: &serde_json::Value) -> serde_json::Value {
+    let mut schema = serde_json::json!({
+        "type":"object",
+        "required":["schema_version","kind"],
+        "properties":{
+            "schema_version":{"type":"integer","const":READ_SCHEMA_VERSION},
+            "kind":{"type":"string","const":kind},
+            "data": data,
+            "error":{
+                "type":"object","required":["code","outcome","detail"],
+                "additionalProperties":false,
+                "properties":{
+                    "code":{"type":"string"},
+                    "outcome":{"type":"string","enum":["blocked","unavailable","outcome_unknown"]},
+                    "detail":{"type":"string"},
+                    "next":{"type":"string"}}}},
+        "additionalProperties":false,
+        "oneOf":[{"required":["data"]},{"required":["error"]}]
+    });
+    if let Some(defs) = data.get("$defs") {
+        schema["$defs"] = defs.clone();
+        if let Some(data_schema) = schema["properties"]["data"].as_object_mut() {
+            data_schema.remove("$defs");
+        }
+    }
+    schema
+}
+
+/// Structured sibling of [`invalid_arguments`]: the same text form plus the
+/// `invalid_arguments` error outcome under the read envelope.
+#[must_use]
+pub fn read_invalid_arguments(
+    templates: &Templates,
+    tool: &str,
+    hint: &str,
+    kind: &str,
+) -> CallToolResult {
+    let result = invalid_arguments(templates, tool, hint);
+    let error = ReadErrorDto {
+        code: "invalid_arguments".to_owned(),
+        outcome: "blocked",
+        detail: bounded(&format!("{tool} rejected the arguments. {hint}"), 300),
+        next: None,
+    };
+    with_structured(result, read_envelope(kind, None, Some(error)))
+}
+
+/// Structured sibling of [`failure`]: the same text form plus the typed error
+/// outcome (code, class, bounded detail) under the read envelope.
+#[must_use]
+pub fn read_failure(templates: &Templates, kind: &str, error: &ServiceError) -> CallToolResult {
+    let result = failure(templates, error);
+    let dto = ReadErrorDto {
+        code: error.code.clone(),
+        outcome: outcome_label(error.outcome),
+        detail: error.detail.clone(),
+        next: error.next.clone(),
+    };
+    with_structured(result, read_envelope(kind, None, Some(dto)))
+}
+
+/// Typed projection of one [`crate::worktree::Probe`] axis: the independent
+/// probe state plus the typed value, or the stable failure code, or the
+/// partial-evidence reason. Exactly the fields matching `state` are filled;
+/// the others serialize as `null` so the shape never varies.
+#[derive(Serialize)]
+pub struct ProbeDto {
+    /// `known`, `not_checked`, `unavailable` or `incomplete`.
+    pub state: &'static str,
+    /// The value when known, the guaranteed partial evidence when
+    /// incomplete, otherwise `null`.
+    pub value: Option<serde_json::Value>,
+    /// Stable reason code when unavailable, otherwise `null`.
+    pub code: Option<String>,
+    /// Bounded reason when incomplete, otherwise `null`.
+    pub reason: Option<String>,
+}
+
+impl ProbeDto {
+    /// Projects one probe through `value`, which converts the typed evidence
+    /// (including [`crate::worktree::Probe::Incomplete`] evidence) to JSON.
+    pub fn from_probe<T>(
+        probe: &crate::worktree::Probe<T>,
+        value: impl Fn(&T) -> serde_json::Value,
+    ) -> Self {
+        match probe {
+            crate::worktree::Probe::Known(known) => Self {
+                state: "known",
+                value: Some(value(known)),
+                code: None,
+                reason: None,
+            },
+            crate::worktree::Probe::NotChecked => Self {
+                state: "not_checked",
+                value: None,
+                code: None,
+                reason: None,
+            },
+            crate::worktree::Probe::Unavailable { code } => Self {
+                state: "unavailable",
+                value: None,
+                code: Some(bounded(code, 120)),
+                reason: None,
+            },
+            crate::worktree::Probe::Incomplete { evidence, reason } => Self {
+                state: "incomplete",
+                value: Some(value(evidence)),
+                code: None,
+                reason: Some(bounded(reason, 200)),
+            },
+        }
+    }
+}
+
+/// Structured form of one advisory warning: a stable code plus the bounded
+/// numeric or textual facts it carries, without human-formatted labels.
+#[must_use]
+pub fn warning_value(warning: &crate::worktree::Warning) -> serde_json::Value {
+    use crate::worktree::Warning;
+    match warning {
+        Warning::SizeAtLeast { bytes } => {
+            serde_json::json!({"code": "size_at_least", "bytes": bytes})
+        }
+        Warning::Unmerged => serde_json::json!({"code": "unmerged"}),
+        Warning::IntegrationUnknown => serde_json::json!({"code": "integration_unknown"}),
+        Warning::ProbeIncomplete { reason } => {
+            serde_json::json!({"code": "probe_incomplete", "reason": bounded(reason, 200)})
+        }
+        Warning::RemovalStarted => serde_json::json!({"code": "removal_started"}),
+        Warning::ResumableDeletion => serde_json::json!({"code": "resumable_deletion"}),
+        Warning::ResumedRemoval => serde_json::json!({"code": "resumed_removal"}),
+        Warning::RecordMismatch => serde_json::json!({"code": "record_mismatch"}),
+    }
+}
+
 /// First text block of a reply; empty when the reply has no text block.
 #[cfg(test)]
 #[must_use]
@@ -335,5 +548,48 @@ mod tests {
         let long = "é".repeat(100);
         let cut = bounded(&long, 10);
         assert!(cut.len() <= 10 && cut.ends_with("..."));
+    }
+
+    #[test]
+    fn read_schema_hoists_defs_and_resolves_refs() {
+        let data = serde_json::json!({
+            "type":"object","required":["rows"],"additionalProperties":false,
+            "properties":{"rows":{"type":"array","items":{"$ref":"#/$defs/row"}}},
+            "$defs":{
+                "row":{"type":"object","required":["key"],"additionalProperties":false,
+                    "properties":{"key":{"type":"string"},"inner":{"$ref":"#/$defs/inner"}}},
+                "inner":{"type":"string"}}}
+        );
+        let schema = read_schema("worktree_page", &data);
+        // `$defs` lives at the document root, where `#/$defs/…` resolves.
+        assert!(schema.get("$defs").is_some());
+        assert!(schema["properties"]["data"].get("$defs").is_none());
+        assert_eq!(schema["properties"]["kind"]["const"], "worktree_page");
+        assert_eq!(schema["properties"]["schema_version"]["const"], 1);
+        fn check(node: &serde_json::Value, root: &serde_json::Value) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::String(reference)) = map.get("$ref") {
+                        let target = reference.strip_prefix("#/").unwrap();
+                        let mut current = root;
+                        for part in target.split('/') {
+                            let part = part.replace("~1", "/").replace("~0", "~");
+                            current = &current[part.as_str()];
+                            assert!(!current.is_null(), "dangling {reference}");
+                        }
+                    }
+                    for value in map.values() {
+                        check(value, root);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for value in items {
+                        check(value, root);
+                    }
+                }
+                _ => {}
+            }
+        }
+        check(&schema, &schema);
     }
 }

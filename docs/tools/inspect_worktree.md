@@ -44,3 +44,23 @@ already collected. Degraded probes keep the reply a successful read.
 - `not_a_repository`.
 - `record_mismatch` warning when a stored record disagrees with the observed
   worktree identity or bound path; the record is ignored for that decision.
+
+## Structured content
+
+Every reply also carries MCP `structuredContent` conforming to the tool's
+`outputSchema` (exported in `schemas/tools.json`): the outer envelope is
+`{"schema_version":1,"kind":"worktree_detail","data":…}` on success and
+`{"schema_version":1,"kind":"worktree_detail","error":{code,outcome,detail,next?}}`
+for every failure — a failed read is never an empty success. The text block
+and `isError` semantics above are unchanged, and the one text block is not a
+JSON duplicate of the structured payload.
+
+`data` keeps the independent probe axes as objects
+`{state, value, code, reason}` with `state` one of `known`,
+`not_checked`, `unavailable`, `incomplete` — degraded probes stay degraded
+instead of collapsing into a value. It adds the canonical repository identity
+(`repo_id`, `repo_common_dir`), the measured activity timestamps
+(`activity_signals`, `null` where not measured), warnings as stable codes,
+the record with its `revision` and `removal_started` marker, and
+`observed_at`. The full branch ref is exposed; no raw config, process
+arguments or credentials appear.

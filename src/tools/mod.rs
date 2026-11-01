@@ -20,6 +20,9 @@ pub fn definitions() -> Vec<Value> {
     vec![
         json!({"name":"get_status", "description":"Report the product identity and release qualification status. Read-only; does not access files or external services.",
         "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
+        "outputSchema":response::read_schema("identity", &json!({
+            "type":"object","required":["product","version","qualification"],"additionalProperties":false,
+            "properties":{"product":{"type":"string"},"version":{"type":"string"},"qualification":{"type":"string"}}})),
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
         tool_create_worktree::definition(),
         tool_list_worktrees::definition(),
@@ -91,17 +94,42 @@ pub async fn call(
                     });
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
                 result.is_error = Some(true);
-                return Some(result);
+                // The refused call still carries its structured error outcome
+                // under the output schema; it is never an empty success.
+                return Some(response::with_structured(
+                    result,
+                    response::read_envelope(
+                        "identity",
+                        None,
+                        Some(response::ReadErrorDto {
+                            code: "invalid_arguments".to_owned(),
+                            outcome: "blocked",
+                            detail: "get_status accepts an empty argument object.".to_owned(),
+                            next: None,
+                        }),
+                    ),
+                ));
             }
             let reply = identity.identity(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
                 crate::qualification(),
             );
-            let mut result =
-                CallToolResult::success(vec![ContentBlock::text(reply.text().to_owned())]);
-            result.is_error = Some(reply.is_error());
-            Some(result)
+            // Identity facts are compile-time constants, so the structured
+            // form exists even when the text presentation degrades.
+            let data = json!({
+                "product": env!("CARGO_PKG_NAME"),
+                "version": env!("CARGO_PKG_VERSION"),
+                "qualification": crate::qualification(),
+            });
+            Some(response::with_structured(
+                CallToolResult::success(vec![ContentBlock::text(reply.text().to_owned())]),
+                response::read_envelope("identity", Some(data), None),
+            ))
+            .map(|mut result| {
+                result.is_error = Some(reply.is_error());
+                result
+            })
         }
         "create_worktree" => Some(tool_create_worktree::call(args, _templates, service).await),
         "list_worktrees" => Some(tool_list_worktrees::call(args, _templates, service).await),

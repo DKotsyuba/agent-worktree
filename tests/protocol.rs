@@ -46,6 +46,21 @@ async fn protocol() {
         let wire = serde_json::to_value(result).unwrap();
         assert_eq!(wire["isError"], false);
         assert_eq!(wire["content"].as_array().unwrap().len(), 1);
+        // The structured identity twin travels beside the one text block.
+        assert_eq!(wire["structuredContent"]["schema_version"], 1);
+        assert_eq!(wire["structuredContent"]["kind"], "identity");
+        assert_eq!(
+            wire["structuredContent"]["data"]["product"],
+            env!("CARGO_PKG_NAME")
+        );
+        assert_eq!(
+            wire["structuredContent"]["data"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(
+            wire["structuredContent"]["data"]["qualification"].is_string(),
+            "{wire}"
+        );
         // The tool surface works end to end: an empty scope lists zero rows.
         let listed_page = client
             .call_tool(CallToolRequestParams::new("list_worktrees"))
@@ -58,6 +73,16 @@ async fn protocol() {
             text.starts_with("OK worktrees: 0 returned; more=false"),
             "{text}"
         );
+        // The empty page is structured data, never an empty success or a
+        // missing result.
+        let page = &wire["structuredContent"];
+        assert_eq!(page["schema_version"], 1);
+        assert_eq!(page["kind"], "worktree_page");
+        assert_eq!(page["data"]["returned"], 0);
+        assert_eq!(page["data"]["has_more"], false);
+        assert!(page["data"]["cursor"].is_null());
+        assert_eq!(page["data"]["rows"].as_array().unwrap().len(), 0);
+        assert_eq!(page["data"]["coverage"]["repos"], 0);
         let bad_tool_args = serde_json::json!({"repo":"/repo","limit":0})
             .as_object()
             .unwrap()
@@ -70,6 +95,14 @@ async fn protocol() {
         assert_eq!(wire["isError"], true);
         let text = wire["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("ERROR limit_out_of_range:"), "{text}");
+        // The failed read is a structured error under the same output schema,
+        // never a success-shaped empty result.
+        let error = &wire["structuredContent"];
+        assert_eq!(error["kind"], "worktree_page");
+        assert!(error.get("data").is_none());
+        assert_eq!(error["error"]["code"], "limit_out_of_range");
+        assert_eq!(error["error"]["outcome"], "blocked");
+        assert_eq!(error["error"]["detail"], "limit must be between 1 and 20");
         let args = serde_json::json!({"unexpected":true})
             .as_object()
             .unwrap()
@@ -78,7 +111,13 @@ async fn protocol() {
             .call_tool(CallToolRequestParams::new("get_status").with_arguments(args))
             .await
             .unwrap();
-        assert_eq!(serde_json::to_value(invalid).unwrap()["isError"], true);
+        let wire = serde_json::to_value(invalid).unwrap();
+        assert_eq!(wire["isError"], true);
+        assert_eq!(
+            wire["structuredContent"]["error"]["code"],
+            "invalid_arguments"
+        );
+        assert_eq!(wire["structuredContent"]["error"]["outcome"], "blocked");
         assert!(
             client
                 .call_tool(CallToolRequestParams::new("missing_tool"))

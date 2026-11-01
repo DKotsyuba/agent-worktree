@@ -12,7 +12,85 @@
       "properties": {},
       "type": "object"
     },
-    "name": "get_status"
+    "name": "get_status",
+    "outputSchema": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "data"
+          ]
+        },
+        {
+          "required": [
+            "error"
+          ]
+        }
+      ],
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "product": {
+              "type": "string"
+            },
+            "qualification": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "product",
+            "version",
+            "qualification"
+          ],
+          "type": "object"
+        },
+        "error": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "next": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "blocked",
+                "unavailable",
+                "outcome_unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "outcome",
+            "detail"
+          ],
+          "type": "object"
+        },
+        "kind": {
+          "const": "identity",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "kind"
+      ],
+      "type": "object"
+    }
   },
   {
     "annotations": {
@@ -111,7 +189,360 @@
       },
       "type": "object"
     },
-    "name": "list_worktrees"
+    "name": "list_worktrees",
+    "outputSchema": {
+      "$defs": {
+        "activity": {
+          "additionalProperties": false,
+          "properties": {
+            "mtime_based": {
+              "description": "true: band from HEAD/index mtimes and the last reflog entry, never process-verified.",
+              "type": "boolean"
+            },
+            "state": {
+              "enum": [
+                "active",
+                "recent",
+                "idle_candidate",
+                "stale_candidate",
+                "unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "mtime_based"
+          ],
+          "type": "object"
+        },
+        "coverage": {
+          "additionalProperties": false,
+          "properties": {
+            "budget_exhausted": {
+              "type": "boolean"
+            },
+            "discovered": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "failed": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "repo": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "repo",
+                  "code"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "orphan_scan_truncated": {
+              "type": "boolean"
+            },
+            "registry": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "repos": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "root_unconfigured": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "repos",
+            "registry",
+            "discovered",
+            "failed",
+            "budget_exhausted",
+            "orphan_scan_truncated",
+            "root_unconfigured"
+          ],
+          "type": "object"
+        },
+        "hygiene": {
+          "additionalProperties": false,
+          "properties": {
+            "idle": {
+              "description": "Includes stale rows.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "large": {
+              "description": "Whether a measured page row reached the large threshold; only meaningful when size was requested.",
+              "type": "boolean"
+            },
+            "missing": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "orphan": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "removal_started": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stale": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unmerged": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "missing",
+            "orphan",
+            "removal_started",
+            "idle",
+            "stale",
+            "unmerged",
+            "large"
+          ],
+          "type": "object"
+        },
+        "row": {
+          "additionalProperties": false,
+          "properties": {
+            "activity": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/activity"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "null when the row was not probed (missing, orphan)."
+            },
+            "branch": {
+              "description": "Full branch ref when attached; null when detached or unknown.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "class": {
+              "enum": [
+                "main",
+                "managed",
+                "foreign",
+                "missing",
+                "orphan_candidate"
+              ],
+              "type": "string"
+            },
+            "creator": {
+              "description": "Record creator when a record backs the row.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "detached": {
+              "type": "boolean"
+            },
+            "head": {
+              "description": "HEAD commit when Git reported it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "integration": {
+              "description": "null when the row was not probed.",
+              "enum": [
+                "ancestor_merged",
+                "unmerged",
+                "unknown",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "key": {
+              "description": "Stable tool key `<id12>/<name>`.",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "removal_started": {
+              "type": "boolean"
+            },
+            "repo_common_dir": {
+              "description": "Canonical absolute Git common directory behind repo_id.",
+              "type": "string"
+            },
+            "repo_id": {
+              "description": "Full 64-hex repository identity.",
+              "type": "string"
+            },
+            "size": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/size"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "null when not requested or not measurable."
+            }
+          },
+          "required": [
+            "key",
+            "repo_id",
+            "repo_common_dir",
+            "path",
+            "class",
+            "branch",
+            "detached",
+            "head",
+            "creator",
+            "removal_started",
+            "activity",
+            "integration",
+            "size"
+          ],
+          "type": "object"
+        },
+        "size": {
+          "additionalProperties": false,
+          "properties": {
+            "bytes": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "quality": {
+              "enum": [
+                "complete",
+                "lower_bound"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "bytes",
+            "quality"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "data"
+          ]
+        },
+        {
+          "required": [
+            "error"
+          ]
+        }
+      ],
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "coverage": {
+              "$ref": "#/$defs/coverage"
+            },
+            "cursor": {
+              "description": "Cursor resuming after the last row; null when no more rows remain.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "has_more": {
+              "type": "boolean"
+            },
+            "hygiene": {
+              "$ref": "#/$defs/hygiene"
+            },
+            "returned": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "items": {
+                "$ref": "#/$defs/row"
+              },
+              "maxItems": 20,
+              "type": "array"
+            }
+          },
+          "required": [
+            "returned",
+            "has_more",
+            "cursor",
+            "rows",
+            "hygiene",
+            "coverage"
+          ],
+          "type": "object"
+        },
+        "error": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "next": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "blocked",
+                "unavailable",
+                "outcome_unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "outcome",
+            "detail"
+          ],
+          "type": "object"
+        },
+        "kind": {
+          "const": "worktree_page",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "kind"
+      ],
+      "type": "object"
+    }
   },
   {
     "annotations": {
@@ -164,7 +595,383 @@
       ],
       "type": "object"
     },
-    "name": "inspect_worktree"
+    "name": "inspect_worktree",
+    "outputSchema": {
+      "$defs": {
+        "hygiene": {
+          "additionalProperties": false,
+          "properties": {
+            "large": {
+              "type": "boolean"
+            },
+            "missing": {
+              "type": "boolean"
+            },
+            "stale_activity": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "stale_activity",
+            "large",
+            "missing"
+          ],
+          "type": "object"
+        },
+        "probe": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "Stable reason code when unavailable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "description": "Bounded reason when incomplete.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "enum": [
+                "known",
+                "not_checked",
+                "unavailable",
+                "incomplete"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "description": "Typed value when known; the guaranteed partial evidence when incomplete; null otherwise."
+            }
+          },
+          "required": [
+            "state",
+            "value",
+            "code",
+            "reason"
+          ],
+          "type": "object"
+        },
+        "probes": {
+          "additionalProperties": false,
+          "properties": {
+            "integration": {
+              "$ref": "#/$defs/probe"
+            },
+            "processes": {
+              "$ref": "#/$defs/probe"
+            },
+            "size": {
+              "$ref": "#/$defs/probe"
+            },
+            "status": {
+              "$ref": "#/$defs/probe"
+            },
+            "submodules": {
+              "$ref": "#/$defs/probe"
+            }
+          },
+          "required": [
+            "integration",
+            "status",
+            "submodules",
+            "processes",
+            "size"
+          ],
+          "type": "object"
+        },
+        "record": {
+          "additionalProperties": false,
+          "properties": {
+            "created_at": {
+              "description": "Unix seconds.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "creator": {
+              "type": "string"
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "removal_started": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "at": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "fingerprint": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "fingerprint",
+                    "at"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "revision": {
+              "description": "Record revision (optimistic concurrency counter).",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "creator",
+            "created_at",
+            "purpose",
+            "session",
+            "revision",
+            "removal_started"
+          ],
+          "type": "object"
+        },
+        "signals": {
+          "additionalProperties": false,
+          "properties": {
+            "head_mtime": {
+              "description": "Unix seconds; null when not measured.",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "index_mtime": {
+              "description": "Unix seconds; null when not measured.",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "last_reflog_entry": {
+              "description": "Unix seconds; null when not measured.",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "head_mtime",
+            "index_mtime",
+            "last_reflog_entry"
+          ],
+          "type": "object"
+        },
+        "warning": {
+          "additionalProperties": false,
+          "properties": {
+            "bytes": {
+              "description": "Present for size_at_least.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "code": {
+              "type": "string"
+            },
+            "reason": {
+              "description": "Bounded; present for probe_incomplete.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "data"
+          ]
+        },
+        {
+          "required": [
+            "error"
+          ]
+        }
+      ],
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "activity": {
+              "description": "unknown means no usable signal, never proof of abandonment.",
+              "enum": [
+                "active",
+                "recent",
+                "idle_candidate",
+                "stale_candidate",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "activity_signals": {
+              "$ref": "#/$defs/signals"
+            },
+            "branch": {
+              "description": "Full branch ref when attached.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "class": {
+              "enum": [
+                "main",
+                "managed",
+                "foreign",
+                "missing",
+                "orphan_candidate"
+              ],
+              "type": "string"
+            },
+            "detached": {
+              "type": "boolean"
+            },
+            "head": {
+              "description": "HEAD commit when Git reported it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hygiene": {
+              "$ref": "#/$defs/hygiene"
+            },
+            "key": {
+              "description": "Stable tool key `<id12>/<name>`.",
+              "type": "string"
+            },
+            "locked": {
+              "description": "Bounded `git worktree lock` reason; null when unlocked.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "observed_at": {
+              "description": "Unix seconds when the observation batch finished.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            },
+            "probes": {
+              "$ref": "#/$defs/probes"
+            },
+            "record": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/record"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "repo_common_dir": {
+              "description": "Canonical absolute Git common directory behind repo_id.",
+              "type": "string"
+            },
+            "repo_id": {
+              "description": "Full 64-hex repository identity.",
+              "type": "string"
+            },
+            "warnings": {
+              "items": {
+                "$ref": "#/$defs/warning"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "key",
+            "repo_id",
+            "repo_common_dir",
+            "class",
+            "path",
+            "head",
+            "branch",
+            "detached",
+            "locked",
+            "activity",
+            "activity_signals",
+            "probes",
+            "warnings",
+            "record",
+            "hygiene",
+            "observed_at"
+          ],
+          "type": "object"
+        },
+        "error": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "next": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "blocked",
+                "unavailable",
+                "outcome_unknown"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "outcome",
+            "detail"
+          ],
+          "type": "object"
+        },
+        "kind": {
+          "const": "worktree_detail",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "kind"
+      ],
+      "type": "object"
+    }
   },
   {
     "annotations": {

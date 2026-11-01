@@ -514,6 +514,7 @@ impl Service {
                 rows.push(ListRow {
                     key: format!("{}/{}", scope.repo_id.id12(), name),
                     repo_id: scope.repo_id.as_str().to_owned(),
+                    common_dir: scope.common_dir.clone(),
                     path: registration.path.clone(),
                     class,
                     branch: registration.branch.clone(),
@@ -580,6 +581,7 @@ impl Service {
                     rows.push(ListRow {
                         key: format!("{}/{}", scope.repo_id.id12(), name),
                         repo_id: scope.repo_id.as_str().to_owned(),
+                        common_dir: scope.common_dir.clone(),
                         path,
                         class: WorktreeClass::OrphanCandidate,
                         branch: None,
@@ -940,6 +942,7 @@ impl Service {
         Ok(InspectOutcome {
             key: format!("{}/{}", scope.repo_id.id12(), target.name),
             class,
+            common_dir: scope.common_dir.clone(),
             observation,
             advice,
             record,
@@ -2517,6 +2520,10 @@ pub struct ListRow {
     pub key: String,
     /// Full repository identity.
     pub repo_id: String,
+    /// Canonical absolute Git common directory behind `repo_id`, taken from
+    /// the already-resolved repository scope; links rows to their repository
+    /// without extra Git probes.
+    pub common_dir: PathBuf,
     /// Absolute worktree path.
     pub path: PathBuf,
     /// Ownership classification.
@@ -2632,6 +2639,9 @@ pub struct InspectOutcome {
     pub key: String,
     /// Ownership classification.
     pub class: WorktreeClass,
+    /// Canonical absolute Git common directory of the owning repository,
+    /// taken from the already-resolved scope; no extra Git probe is spent.
+    pub common_dir: PathBuf,
     /// Full observation evidence.
     pub observation: Observation,
     /// Classified advice.
@@ -2820,6 +2830,7 @@ mod tests {
         ListRow {
             key: key.to_owned(),
             repo_id: sample_id(),
+            common_dir: PathBuf::from("/repo/.git"),
             path: PathBuf::from(path),
             class: WorktreeClass::Managed,
             branch: Some("refs/heads/aw/x".to_owned()),

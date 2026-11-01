@@ -70,3 +70,25 @@ is safe under keyset order.
 - `invalid_arguments`, `limit_out_of_range`, `cursor_invalid`,
   `cursor_scope_mismatch`, `repo_path_invalid`, `not_a_repository`,
   `invalid_config` (relative `[storage] root` or `[discovery] roots` entry).
+
+## Structured content
+
+Every reply also carries MCP `structuredContent` conforming to the tool's
+`outputSchema` (exported in `schemas/tools.json`): the outer envelope is
+`{"schema_version":1,"kind":"worktree_page","data":…}` on success and
+`{"schema_version":1,"kind":"worktree_page","error":{code,outcome,detail,next?}}`
+for every failure — a failed read is never an empty success. The text block
+and `isError` semantics above are unchanged, and the one text block is not a
+JSON duplicate of the structured payload.
+
+`data` is the typed twin of this page: `returned`, `has_more`, `cursor`,
+`rows`, `hygiene` and `coverage` with the same page semantics as the text.
+Each row keeps the stable `key` and adds the canonical repository identity
+(`repo_id`, `repo_common_dir`), the full `branch` ref, `detached`, `head`,
+`creator`, `removal_started`, an mtime-based `activity`
+(`{state, mtime_based}` — `state:"unknown"` means the page pass did not
+finish, `null` means the row was not probed), `integration`
+(`ancestor_merged`/`unmerged`/`unknown`/`null`) and numeric
+`size {bytes, quality}` (`null` when not requested). Text rows keep their
+display labels (`recent~`, `2.0 GiB (lower bound)`); the structured values
+are never human-formatted.

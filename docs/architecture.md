@@ -240,6 +240,17 @@ rendered from typed views through the embedded MiniJinja renderer in
 `src/response.rs` per `docs/MCP_RESPONSE_STANDARD.md`. The binary includes an
 installer (`self-install`, `releases` subcommands).
 
+The three read tools (`get_status`, `list_worktrees`, `inspect_worktree`)
+additionally return MCP `structuredContent` with a declared `outputSchema`:
+an additive machine-readable twin of the unchanged text reply under the
+stable envelope `{"schema_version":1,"kind":"identity"|"worktree_page"|
+"worktree_detail","data":…}`, with typed `error {code, outcome, detail}`
+outcomes for every failure — a failed read is never an empty success, and a
+text presentation failure keeps the structured data. Rows and details carry
+the canonical repository identity (`repo_id` plus the Git common directory)
+from the already-resolved service scope, numeric sizes and explicit
+unknown/unprobed `null`s; mutating tools have no structured content.
+
 ### Delivery (local state profile)
 
 `family.toml` declares `profiles.state = "local"`; `cargo xtask package`

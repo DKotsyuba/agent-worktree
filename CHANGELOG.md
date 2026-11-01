@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- Machine-readable read contract for `get_status`, `list_worktrees` and
+  `inspect_worktree`: every reply now also carries MCP `structuredContent`
+  (`{"schema_version":1,"kind":…,"data":…}`, or the same envelope with
+  `{"error":{code,outcome,detail,next?}}` for any failure — a failed read is
+  never an empty success) plus a matching per-tool `outputSchema` exported in
+  `schemas/tools.json`. `list` rows expose the stable key, full repository
+  identity (`repo_id` and the canonical Git common dir), full branch ref,
+  `detached`/`head`/`creator`, `removal_started`, typed activity
+  (`{state,mtime_based}`) and integration values with explicit
+  unknown/unprobed `null`s, and numeric `size {bytes,quality}`;
+  `inspect` keeps the five independent `Probe` states (`known`,
+  `not_checked`, `unavailable`, `incomplete` with reasons), warnings as
+  stable codes, the record `revision` and only actually measured timestamps.
+  The compact text replies, refusals and safety behavior are unchanged; reads
+  still add no records and mutate nothing.
+
 ## 0.1.3
 
 ### Fixed
