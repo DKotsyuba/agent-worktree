@@ -339,8 +339,14 @@ impl Project {
                 "-D",
                 "warnings",
             ],
-            vec!["test", "--frozen", "--workspace"],
-            vec!["test", "--frozen", "--workspace", "--all-features"],
+            vec!["test", "--frozen", "--workspace", "--no-fail-fast"],
+            vec![
+                "test",
+                "--frozen",
+                "--workspace",
+                "--all-features",
+                "--no-fail-fast",
+            ],
         ] {
             run(&self.root, "cargo", &args)?;
         }
