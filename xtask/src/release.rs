@@ -160,7 +160,8 @@ fn publish(project: &Project, directory: PathBuf) -> Result<()> {
             "-p",
             &project.name,
             "--test",
-            "protocol",
+            "it",
+            "protocol::",
         ],
     ] {
         if !Command::new("cargo")
