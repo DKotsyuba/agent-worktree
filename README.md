@@ -110,7 +110,7 @@ notification per 24 h-idle worktree, see
 
 ```bash
 cargo fetch --locked
-cargo xtask check          # full non-mutating gate
+cargo xtask check          # full non-mutating gate (requires cargo-nextest)
 cargo xtask test protocol
 cargo xtask test presentation
 cargo xtask test delivery

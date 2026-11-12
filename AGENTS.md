@@ -6,7 +6,7 @@ behaviour truth source.
 
 ## Single workflow
 
-`cargo xtask check` is the full non-mutating gate; run it before claiming done.
+`cargo xtask check` is the full non-mutating gate; run it before claiming done. It requires cargo-nextest; set `XTASK_TEST_TMPFS=0` to keep test temporaries off tmpfs. Add each new `tests/*.rs` as a module of `tests/it/main.rs`.
 Add a tool with `cargo xtask add-tool NAME --effect read|external-write
 --response entity|page|ack`: it generates the typed skeleton in `src/tools/`,
 wires the registry in `src/tools/mod.rs` (`definitions`, `templates`,
