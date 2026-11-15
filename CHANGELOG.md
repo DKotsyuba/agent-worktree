@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.4
+
 ### Changed
 
 - Stale test scratch cleanup accepts only canonical decimal PIDs and is skipped when the PID namespace is unknown.
