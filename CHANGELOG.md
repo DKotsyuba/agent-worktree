@@ -9,6 +9,7 @@
 
 ### Changed
 
+- `x86_64-unknown-linux-gnu` is a qualified target (native gate, shipped-binary protocol tests and delivery checks on a Linux x86_64 glibc host); see `docs/qualification.md`.
 - Temporarily ignore the informational chrono unmaintained advisory required by rmcp; re-check by 2027-02-01.
 
 ## 0.1.4

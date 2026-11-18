@@ -16,7 +16,7 @@ host_adapter = true
 
 [compatibility]
 candidate_targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
-qualified_targets = ["aarch64-apple-darwin"]
+qualified_targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 qualified_hosts = ["claude-code", "codex"]
 
 [release]

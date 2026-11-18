@@ -8,6 +8,7 @@ qualification evidence.
 ## Current record
 
 - Target: `aarch64-apple-darwin` (macOS 27.0, arm64).
+- Target: `x86_64-unknown-linux-gnu` (Linux x86_64, glibc 2.39 host, Rust 1.98.1).
 - Hosts: Claude Code 2.1.280, Codex CLI 0.156.1.
 - Source: `main` after `e2dae10`.
 
@@ -20,6 +21,9 @@ qualification evidence.
 | Delivery | `cargo xtask package` → `package verify` → `self-install` into a temporary home holding `config.toml` and `state/v1/*` → launcher `--version`, `doctor`, `releases use` | green; state and config byte-identical before and after |
 | Live integration, Claude Code | MCP server connected (`claude mcp list`); a headless session called `list_worktrees` and received a correct page; the `UserPromptSubmit` hook injected one `<agent-worktree>` block in a live session | passed |
 | Live integration, Codex | a headless `codex exec` session called `list_worktrees` through the configured MCP server and received a correct page | passed |
+| Linux native gate | `cargo xtask check` on a Linux x86_64 glibc host (same gate as above: fmt, clippy twice, 206 tests twice under nextest, rustdoc, contract) on the 0.1.5 release content (commit `ee05a50`) | green |
+| Linux delivery | `cargo xtask package` → `package verify` → `MCP_TEST_BINARY=<shipped binary> cargo test --test it protocol::` (6 protocol tests) → `self-install` into a scratch home holding `config.toml` and `state/v1/*` → launcher `--version`, `doctor`, `releases use` | green; state and config byte-identical before and after; binary links only glibc, libm and libgcc_s |
+| Linux live use | the binary runs daily on the Linux host: an orchestration hub and agent sessions create, list, inspect and remove worktrees through the MCP server (owner-reported use; not re-run as a scripted session) | in use, no defects reported |
 | Live use on the host | worktrees created in the configured root, listed across 40 repositories, removed through preview → fingerprint → apply (vetoes observed: live process, untracked files, ignored files), stale registrations pruned with paged preview | passed; no work or branch lost |
 
 ## Known limits
