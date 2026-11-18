@@ -44,6 +44,48 @@ fn repo_valid(repo: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         })
 }
+/// Replace the workspace version without reformatting the manifest.
+fn edit_manifest_version(source: &str, old: &str, new: &str) -> Result<String> {
+    let mut in_package = false;
+    let mut found = false;
+    let mut output = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[workspace.package]";
+        }
+        if in_package && trimmed.starts_with("version") {
+            let (key, value) = line.split_once('=').ok_or("invalid workspace version")?;
+            if key.trim() == "version" {
+                let expected = format!("\"{old}\"");
+                let offset = value
+                    .find(&expected)
+                    .ok_or("unexpected workspace version")?;
+                if found
+                    || !value[..offset].trim().is_empty()
+                    || !value[offset + expected.len()..].trim().is_empty()
+                        && !value[offset + expected.len()..]
+                            .trim_start()
+                            .starts_with('#')
+                {
+                    return Err("ambiguous workspace version".into());
+                }
+                output.push_str(key);
+                output.push('=');
+                output.push_str(&value[..offset]);
+                output.push_str(&format!("\"{new}\""));
+                output.push_str(&value[offset + expected.len()..]);
+                found = true;
+                continue;
+            }
+        }
+        output.push_str(line);
+    }
+    if !found {
+        return Err("workspace version missing".into());
+    }
+    Ok(output)
+}
 fn prepare(project: &Project, version: &str, apply: bool) -> Result<()> {
     let old = semver::Version::parse(&project.version)?;
     let new = semver::Version::parse(version)?;
@@ -64,11 +106,11 @@ fn prepare(project: &Project, version: &str, apply: bool) -> Result<()> {
     if !apply {
         return Ok(());
     }
-    let mut manifest = project.manifest.clone();
-    manifest["workspace"]["package"]["version"] = toml::Value::String(version.to_owned());
+    let manifest_path = project.root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path)?;
     fs::write(
-        project.root.join("Cargo.toml"),
-        toml::to_string_pretty(&manifest)?,
+        manifest_path,
+        edit_manifest_version(&manifest, &project.version, version)?,
     )?;
     fs::write(
         project.root.join("CHANGELOG.md"),
@@ -532,5 +574,20 @@ mod tests {
         for r in ["x", "x/y/z", "x/y?token=a", "/x", "https://github.com/x/y"] {
             assert!(!repo_valid(r));
         }
+    }
+}
+
+#[cfg(test)]
+mod version_edit_tests {
+    use super::edit_manifest_version;
+
+    #[test]
+    fn preserves_comments_and_order() -> super::Result<()> {
+        let source = "# leading\n[workspace.package]\nedition = \"2024\"\nversion = \"0.1.4\" # keep\nlicense = \"MIT\"\n[package]\nversion = \"other\"\n";
+        assert_eq!(
+            edit_manifest_version(source, "0.1.4", "0.1.5")?,
+            source.replacen("\"0.1.4\"", "\"0.1.5\"", 1)
+        );
+        Ok(())
     }
 }
