@@ -1,7 +1,7 @@
 //! Explicit release operations. Local preparation never commits, tags or pushes.
 use crate::{Project, Result, capture, json, run, text};
 use clap::Subcommand;
-use family_delivery::{Manifest, verify};
+use family_delivery::{ReleaseManifest, host_target, verify_release, verify_sums};
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
@@ -139,7 +139,10 @@ fn prepare(project: &Project, version: &str, apply: bool) -> Result<()> {
 }
 fn publish(project: &Project, directory: PathBuf) -> Result<()> {
     let directory = fs::canonicalize(directory)?;
-    let m = verify(&directory)?;
+    let release = verify_release(&directory)?;
+    // Only the payload for this host can be executed here; the others are
+    // hash-verified, and were accepted by the build job of their own target.
+    let m = release.select(host_target()?)?;
     let tag = format!("v{}", m.version);
     let repo = project.family["repository"]
         .as_str()
@@ -149,7 +152,12 @@ fn publish(project: &Project, directory: PathBuf) -> Result<()> {
         || project.family["qualification"].as_str() != Some("verified")
         || !project.family["compatibility"]["qualified_targets"]
             .as_array()
-            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(m.target.as_str())))
+            .is_some_and(|a| {
+                release
+                    .payloads
+                    .iter()
+                    .all(|p| a.iter().any(|v| v.as_str() == Some(p.target.as_str())))
+            })
         || !project.family["compatibility"]["qualified_hosts"]
             .as_array()
             .is_some_and(|a| !a.is_empty())
@@ -219,7 +227,7 @@ fn publish(project: &Project, directory: PathBuf) -> Result<()> {
             return Err("supply-chain or shipped-binary acceptance failed".into());
         }
     }
-    if verify(&directory)? != m {
+    if verify_release(&directory)? != release {
         return Err("payload changed after acceptance".into());
     }
     let changelog = fs::read_to_string(project.root.join("CHANGELOG.md"))?;
@@ -240,58 +248,63 @@ fn publish(project: &Project, directory: PathBuf) -> Result<()> {
     let installer = project.root.join("install.sh");
     let sums_path = project.root.join("target/SHA256SUMS");
     let mut sums = String::new();
-    for (name, file) in [
-        (m.binary.as_str(), &binary),
-        ("release-manifest.json", &manifest),
-        ("install.sh", &installer),
-    ] {
+    let mut files: Vec<(&str, PathBuf)> = release
+        .payloads
+        .iter()
+        .map(|p| (p.binary.as_str(), directory.join(&p.binary)))
+        .collect();
+    files.push(("release-manifest.json", manifest.clone()));
+    files.push(("install.sh", installer.clone()));
+    for (name, file) in &files {
         sums.push_str(&format!("{}  {name}\n", family_delivery::digest(file)?.1));
     }
+    let expected: Vec<(&str, &str)> = release
+        .payloads
+        .iter()
+        .map(|p| (p.binary.as_str(), p.sha256.as_str()))
+        .collect();
+    verify_sums(&sums, &expected)?;
     fs::write(&sums_path, sums)?;
     // Existing releases (including drafts) cause create to fail. No --clobber path exists.
-    run(
-        &project.root,
-        "gh",
-        &[
-            "release",
-            "create",
-            &tag,
-            binary_str,
-            manifest.to_str().ok_or("manifest path")?,
-            installer.to_str().ok_or("installer path")?,
-            sums_path.to_str().ok_or("checksum path")?,
-            "--repo",
-            repo,
-            "--verify-tag",
-            "--draft",
-            "--title",
-            &tag,
-            "--notes-file",
-            notes.to_str().ok_or("notes path")?,
-        ],
-    )?;
+    let mut create = vec!["release".to_owned(), "create".into(), tag.clone()];
+    for (_, file) in &files {
+        create.push(file.to_str().ok_or("asset path")?.to_owned());
+    }
+    create.push(sums_path.to_str().ok_or("checksum path")?.to_owned());
+    for arg in [
+        "--repo",
+        repo,
+        "--verify-tag",
+        "--draft",
+        "--title",
+        &tag,
+        "--notes-file",
+        notes.to_str().ok_or("notes path")?,
+    ] {
+        create.push(arg.to_owned());
+    }
+    let create: Vec<&str> = create.iter().map(String::as_str).collect();
+    run(&project.root, "gh", &create)?;
     let verify_dir = project
         .root
         .join(format!("target/upload-verify-{}", std::process::id()));
     fs::create_dir(&verify_dir)?;
-    run(
-        &project.root,
-        "gh",
-        &[
-            "release",
-            "download",
-            &tag,
-            "--repo",
-            repo,
-            "--dir",
-            verify_dir.to_str().ok_or("verify path")?,
-            "--pattern",
-            &m.binary,
-            "--pattern",
-            "release-manifest.json",
-        ],
-    )?;
-    if verify(&verify_dir)? != m {
+    let mut download = vec![
+        "release",
+        "download",
+        &tag,
+        "--repo",
+        repo,
+        "--dir",
+        verify_dir.to_str().ok_or("verify path")?,
+        "--pattern",
+        "release-manifest.json",
+    ];
+    for payload in &release.payloads {
+        download.extend(["--pattern", &payload.binary]);
+    }
+    run(&project.root, "gh", &download)?;
+    if verify_release(&verify_dir)? != release {
         return Err("uploaded payload differs; draft left unpublished".into());
     }
     let bootstrap_dir = project
@@ -356,6 +369,8 @@ fn wait(
         .target_dir
         .join(format!("release-wait-{}", std::process::id()));
     fs::create_dir(&dir)?;
+    let sums_dir = dir.with_file_name(format!("release-wait-sums-{}", std::process::id()));
+    fs::create_dir(&sums_dir)?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let remaining = || -> Result<u64> {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -415,8 +430,8 @@ fn wait(
             ],
             remaining()?,
         )?;
-        let m: Manifest = serde_json::from_slice(&bytes)?;
-        m.validate()?;
+        // Version-1 (single payload) and version-2 (several payloads) manifests are both accepted.
+        let m = ReleaseManifest::parse(&bytes)?;
         if m.source_commit != commit || format!("v{}", m.version) != tag {
             return Err("release manifest identity mismatch".into());
         }
@@ -482,12 +497,35 @@ fn wait(
         if object["type"] != "commit" || object["sha"] != commit {
             return Err("tag no longer resolves to expected source".into());
         }
-        let asset = assets
-            .iter()
-            .find(|a| a["name"] == m.binary)
-            .ok_or("binary asset absent")?;
-        if asset["size"].as_u64() != Some(m.size) {
-            return Err("asset inventory size mismatch".into());
+        for payload in &m.payloads {
+            let asset = assets
+                .iter()
+                .find(|a| a["name"] == payload.binary)
+                .ok_or("binary asset absent")?;
+            if asset["size"].as_u64() != Some(payload.size) {
+                return Err("asset inventory size mismatch".into());
+            }
+        }
+        if !assets.iter().any(|a| a["name"] == "SHA256SUMS") {
+            return Err("checksum asset absent".into());
+        }
+        let mut download = vec![
+            "release",
+            "download",
+            tag,
+            "--repo",
+            repo,
+            "--dir",
+            dir.to_str().ok_or("wait path")?,
+            "--pattern",
+            "release-manifest.json",
+        ];
+        for payload in &m.payloads {
+            download.extend(["--pattern", &payload.binary]);
+        }
+        capture(&project.root, "gh", &download, remaining()?)?;
+        if verify_release(&dir)? != m {
+            return Err("downloaded bytes differ from observed manifest".into());
         }
         capture(
             &project.root,
@@ -499,18 +537,23 @@ fn wait(
                 "--repo",
                 repo,
                 "--dir",
-                dir.to_str().ok_or("wait path")?,
+                sums_dir.to_str().ok_or("wait path")?,
                 "--pattern",
-                &m.binary,
-                "--pattern",
-                "release-manifest.json",
+                "SHA256SUMS",
             ],
             remaining()?,
         )?;
-        if verify(&dir)? != m {
-            return Err("downloaded bytes differ from observed manifest".into());
-        }
-        let event = json!({"schema_version":1,"status":"published","repo":repo,"tag":tag,"commit":commit,"run_id":run_id,"run_attempt":m.run_attempt,"verified_assets":[m.binary,"release-manifest.json"],"artifact_integrity":"verified","provenance_verification":"not_performed","installed":false,"agent_awakened":false});
+        let manifest_sha = family_delivery::digest(&dir.join("release-manifest.json"))?.1;
+        let mut expected: Vec<(&str, &str)> = m
+            .payloads
+            .iter()
+            .map(|p| (p.binary.as_str(), p.sha256.as_str()))
+            .collect();
+        expected.push(("release-manifest.json", manifest_sha.as_str()));
+        verify_sums(&fs::read_to_string(sums_dir.join("SHA256SUMS"))?, &expected)?;
+        let mut verified: Vec<&str> = m.payloads.iter().map(|p| p.binary.as_str()).collect();
+        verified.extend(["release-manifest.json", "SHA256SUMS"]);
+        let event = json!({"schema_version":1,"status":"published","repo":repo,"tag":tag,"commit":commit,"run_id":run_id,"run_attempt":m.run_attempt,"verified_assets":verified,"targets":m.payloads.iter().map(|p| p.target.as_str()).collect::<Vec<_>>(),"artifact_integrity":"verified","provenance_verification":"not_performed","installed":false,"agent_awakened":false});
         let text = serde_json::to_string(&event)?;
         if let Some(path) = result_file {
             let mut opts = OpenOptions::new();

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Authenticated/public bootstrap for the single-binary-v1 profile. No tar extraction.
+# One raw binary per supported target; the host's payload is selected, never guessed.
 set +x
 set -euo pipefail
 umask 077
@@ -21,7 +22,14 @@ done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || { echo 'Use an explicit version' >&2; exit 2; }
 [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo 'Repository is missing or invalid' >&2; exit 2; }
 [[ "$home" == /* && "$bin_dir" == /* ]] || { echo 'Installation paths must be absolute' >&2; exit 2; }
-case "$(uname -s):$(uname -m)" in Darwin:arm64) target=aarch64-apple-darwin;; *) echo 'This installer is currently macOS arm64 only' >&2; exit 2;; esac
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) target=aarch64-apple-darwin;;
+  Linux:x86_64)
+    # The Linux payload links glibc; refuse hosts (musl, Alpine) where it cannot run.
+    getconf GNU_LIBC_VERSION >/dev/null 2>&1 || { echo 'The Linux payload needs glibc' >&2; exit 2; }
+    target=x86_64-unknown-linux-gnu;;
+  *) echo 'Unsupported host: payloads exist for macOS arm64 and Linux x86_64 (glibc) only' >&2; exit 2;;
+esac
 asset="$PRODUCT-$target"
 temp=$(mktemp -d "${TMPDIR:-/tmp}/agent-mcp-install.XXXXXXXX")
 trap 'rm -rf -- "$temp"' EXIT
@@ -42,15 +50,28 @@ download() {
   fi
   (($(wc -c < "$output") <= max)) || return 1
 }
+sha256_of() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
 download SHA256SUMS "$temp/SHA256SUMS" 8192
 download release-manifest.json "$temp/bundle/release-manifest.json" 16384
 download "$asset" "$temp/bundle/$asset" 536870912
 for name in "$asset" release-manifest.json; do
   expected=$(awk -v n="$name" '$2 == n {count++; hash=$1} END {if(count != 1) exit 1; print hash}' "$temp/SHA256SUMS")
   [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo 'Invalid checksum entry' >&2; exit 1; }
-  actual=$(shasum -a 256 "$temp/bundle/$name" | awk '{print $1}')
+  actual=$(sha256_of "$temp/bundle/$name")
   [[ "$actual" == "$expected" ]] || { echo 'Checksum mismatch; no candidate executed' >&2; exit 1; }
 done
+# The manifest must list this host's payload with the same size and hash (old single-payload and
+# new multi-payload manifests share the per-payload layout). The binary re-validates all of it.
+actual=$(sha256_of "$temp/bundle/$asset")
+size=$(wc -c < "$temp/bundle/$asset" | tr -d ' ')
+awk -v asset="$asset" -v sha="$actual" -v size="$size" '
+  /"binary":/ {listed = index($0, "\"" asset "\"") > 0; hit_sha = hit_size = 0; next}
+  listed && /"size":/ {hit_size = index($0, "\"size\": " size ",") > 0}
+  listed && /"sha256":/ {hit_sha = index($0, "\"" sha "\"") > 0}
+  listed && hit_size && hit_sha {ok = 1}
+  END {exit ok ? 0 : 1}' "$temp/bundle/release-manifest.json" || { echo 'Manifest does not list this host payload as downloaded; no candidate executed' >&2; exit 1; }
 # Checksums are not signatures. Trust is the authenticated GitHub origin / explicitly selected public origin.
 unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 mkdir -p "$bin_dir"

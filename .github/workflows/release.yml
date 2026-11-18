@@ -9,19 +9,44 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    runs-on: macos-26
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-26
+            machine: arm64
+            nextest_asset: universal-apple-darwin
+            nextest_sha256: 47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            machine: x86_64
+            nextest_asset: x86_64-unknown-linux-gnu
+            nextest_sha256: 32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770
+    env:
+      TARGET: ${{ matrix.target }}
+      MACHINE: ${{ matrix.machine }}
+      NEXTEST_ASSET: ${{ matrix.nextest_asset }}
+      NEXTEST_SHA256: ${{ matrix.nextest_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - run: test "$(uname -m)" = arm64
+      - run: test "$(uname -m)" = "$MACHINE"
       - run: cargo fetch --locked
       - name: Install cargo-nextest 0.9.149 from the checksum-verified release archive
+        shell: bash
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-universal-apple-darwin.tar.gz
-          echo "47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
+          curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-$NEXTEST_ASSET.tar.gz"
+          if command -v sha256sum >/dev/null; then
+            echo "$NEXTEST_SHA256  $RUNNER_TEMP/nextest.tar.gz" | sha256sum -c -
+          else
+            echo "$NEXTEST_SHA256  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
+          fi
           mkdir -p "$RUNNER_TEMP/nextest-bin"
           tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/nextest-bin"
           echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
@@ -33,14 +58,40 @@ jobs:
           cargo xtask package verify "$bundle"
           mkdir "$RUNNER_TEMP/upload"
           cp "$bundle/"* "$RUNNER_TEMP/upload/"
+          # Raw binary named <product>-<target>: exactly the asset published for this target.
+          test -f "$bundle/agent-worktree-$TARGET"
+      - name: Accept the shipped binary of this target
+        shell: bash
+        run: |
+          # The publish job can only run the payload of its own host; each other target is accepted here.
+          chmod 755 "$RUNNER_TEMP/upload/agent-worktree-$TARGET"
+          MCP_TEST_BINARY="$RUNNER_TEMP/upload/agent-worktree-$TARGET" cargo test --frozen --test it protocol::
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: payload
+          name: payload-${{ matrix.target }}
           path: ${{ runner.temp }}/upload/
           if-no-files-found: error
           retention-days: 7
-  publish:
+  attest:
+    # Additive provenance: one GitHub artifact attestation per payload binary. Nothing is built
+    # here, so the OIDC token is never exposed to project code.
     needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: payload-*
+          path: ${{ runner.temp }}/payloads
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/payloads/payload-*/agent-worktree-*
+  publish:
+    needs: [build, attest]
     runs-on: macos-26
     timeout-minutes: 40
     permissions:
@@ -53,19 +104,20 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: payload
-          path: ${{ runner.temp }}/payload
+          pattern: payload-*
+          path: ${{ runner.temp }}/payloads
       - name: Build only tooling, without release credentials in its environment
         run: |
           cargo fetch --locked
           cargo build --frozen -p xtask
           cargo install cargo-deny --version 0.20.2 --locked
-      - name: Verify hashes before giving the payload executable permissions
+      - name: Merge the per-target payloads and verify hashes before giving the payload executable permissions
         shell: bash
         run: |
+          target/debug/xtask package merge "$RUNNER_TEMP/payload" "$RUNNER_TEMP"/payloads/payload-*
           target/debug/xtask package verify "$RUNNER_TEMP/payload"
           find "$RUNNER_TEMP/payload" -type f ! -name release-manifest.json -exec chmod 755 {} \;
-      - name: Test the shipped payload, publish a complete draft, then make it visible
+      - name: Test the shipped payload of this host, publish a complete draft, then make it visible
         env:
           GH_TOKEN: ${{ github.token }}
         run: target/debug/xtask release publish "$RUNNER_TEMP/payload"
