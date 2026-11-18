@@ -27,7 +27,7 @@ jobs:
             nextest_asset: x86_64-unknown-linux-gnu
             nextest_sha256: 32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770
     env:
-      TARGET: ${{ matrix.target }}
+      PAYLOAD_TARGET: ${{ matrix.target }}
       MACHINE: ${{ matrix.machine }}
       NEXTEST_ASSET: ${{ matrix.nextest_asset }}
       NEXTEST_SHA256: ${{ matrix.nextest_sha256 }}
@@ -59,13 +59,13 @@ jobs:
           mkdir "$RUNNER_TEMP/upload"
           cp "$bundle/"* "$RUNNER_TEMP/upload/"
           # Raw binary named <product>-<target>: exactly the asset published for this target.
-          test -f "$bundle/agent-worktree-$TARGET"
+          test -f "$bundle/agent-worktree-$PAYLOAD_TARGET"
       - name: Accept the shipped binary of this target
         shell: bash
         run: |
           # The publish job can only run the payload of its own host; each other target is accepted here.
-          chmod 755 "$RUNNER_TEMP/upload/agent-worktree-$TARGET"
-          MCP_TEST_BINARY="$RUNNER_TEMP/upload/agent-worktree-$TARGET" cargo test --frozen --test it protocol::
+          chmod 755 "$RUNNER_TEMP/upload/agent-worktree-$PAYLOAD_TARGET"
+          MCP_TEST_BINARY="$RUNNER_TEMP/upload/agent-worktree-$PAYLOAD_TARGET" cargo test --frozen --test it protocol::
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: payload-${{ matrix.target }}
