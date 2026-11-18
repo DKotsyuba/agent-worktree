@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+### Added
+
+- Release workflow builds a raw `agent-worktree-x86_64-unknown-linux-gnu` payload next to the macOS one, with a GitHub artifact attestation per payload; `release-manifest.json` is now schema version 2 and lists every payload (target, asset, size, SHA-256), while single-payload version-1 manifests are still read.
+- `install.sh` selects the payload for the host (macOS arm64, Linux x86_64 with glibc), checks it against `SHA256SUMS` and the manifest, and refuses other hosts; `self-install` and `releases use` verify only the host target's payload.
+- `cargo xtask package merge` combines per-target bundles; `release publish` and `release wait` verify every payload and `SHA256SUMS`.
+
 ### Changed
 
 - Temporarily ignore the informational chrono unmaintained advisory required by rmcp; re-check by 2027-02-01.

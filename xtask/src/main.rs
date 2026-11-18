@@ -75,7 +75,15 @@ enum Contract {
 }
 #[derive(Subcommand)]
 enum PackageCommand {
+    /// Verify a bundle: the manifest and every payload it lists, nothing else.
     Verify { directory: PathBuf },
+    /// Combine per-target bundles of one release into a new directory with one manifest.
+    Merge {
+        /// New directory to create.
+        output: PathBuf,
+        #[arg(required = true)]
+        bundles: Vec<PathBuf>,
+    },
 }
 
 pub(crate) struct Project {
@@ -744,7 +752,7 @@ impl Project {
             .join(format!("{}-{}-{}", self.name, self.version, target));
         fs::create_dir_all(output.parent().ok_or("package parent absent")?)?;
         let manifest = Manifest {
-            schema_version: 1,
+            schema_version: 2,
             profile: "single-binary-v1".into(),
             product: self.name.clone(),
             version: self.version.clone(),
@@ -845,7 +853,16 @@ fn main_result() -> Result<()> {
         } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&family_delivery::verify(&directory)?)?
+                serde_json::to_string_pretty(&family_delivery::verify_release(&directory)?)?
+            );
+            Ok(())
+        }
+        Task::Package {
+            command: Some(PackageCommand::Merge { output, bundles }),
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&family_delivery::merge(&bundles, &output)?)?
             );
             Ok(())
         }

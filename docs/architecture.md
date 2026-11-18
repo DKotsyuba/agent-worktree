@@ -256,7 +256,14 @@ unknown/unprobed `null`s; mutating tools have no structured content.
 `family.toml` declares `profiles.state = "local"`; `cargo xtask package`
 builds the release binary and stamps `state_schema = 1` (the current on-disk
 `state/v1` schema, `family_delivery::CURRENT_STATE_SCHEMA`; `none` packs 0)
-into the `single-binary-v1` bundle next to its SHA-256 manifest. Installing
+into the `single-binary-v1` bundle next to its SHA-256 manifest. A release
+carries one raw binary per target, named `<product>-<target>`
+(`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`); `release-manifest.json`
+(schema version 2; version-1 single-payload files stay readable) lists every
+payload with target, asset name, size and SHA-256, `SHA256SUMS` covers all
+assets, and each payload also has a GitHub artifact attestation. Consumers
+select the payload for their own host and refuse unknown or unlisted targets.
+Installing
 (`install.sh --version X.Y.Z` from a GitHub release, or `self-install` on a
 local bundle) writes only under `<home>/standalone/releases/<version>` plus
 the managed launcher in the bin directory: the owner's `config.toml` and

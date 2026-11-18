@@ -24,6 +24,6 @@ qualification evidence.
 
 ## Known limits
 
-- Only macOS arm64 is qualified.
+- Only macOS arm64 is qualified. `x86_64-unknown-linux-gnu` is a release candidate target: the release workflow builds, gates and packages it, but it is not in `qualified_targets`, so `release publish` refuses a release that carries its payload until an owner reviews native and host evidence and promotes it.
 - The Codex hook path was configured but its injection was not observed live (the rate limit window was active); the Claude Code hook was observed.
 - Claude Code `WorktreeCreate` hook and the Codex worktree-root setting described in `docs/harness-setup.md` are documented, not qualified.

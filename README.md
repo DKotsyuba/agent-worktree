@@ -39,8 +39,9 @@ cargo build --locked        # binary at target/debug/agent-worktree
 cargo build --locked --release
 ```
 
-Install from a GitHub release (downloads the bundle, verifies every asset
-against the release's `SHA256SUMS`, installs to
+Install from a GitHub release (picks the raw binary for the host target —
+macOS arm64 or Linux x86_64 with glibc; other hosts are refused — verifies it
+and the manifest against the release's `SHA256SUMS`, installs to
 `~/.agent-worktree/standalone/releases/<version>` and manages the launcher
 `~/.local/bin/agent-worktree`):
 
