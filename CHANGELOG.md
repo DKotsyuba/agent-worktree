@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+
+## 0.1.5
 ### Added
 
 - Release workflow builds a raw `agent-worktree-x86_64-unknown-linux-gnu` payload next to the macOS one, with a GitHub artifact attestation per payload; `release-manifest.json` is now schema version 2 and lists every payload (target, asset, size, SHA-256), while single-payload version-1 manifests are still read.
