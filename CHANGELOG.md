@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+### Changed
+
+- Temporarily ignore the informational chrono unmaintained advisory required by rmcp; re-check by 2027-02-01.
 
 ## 0.1.4
 
